@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 11:29:19 +0200
+Subject: [PATCH 4/7] feat: add POST /admin/discount-codes for staff to create
+ codes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                            |  2 ++
+ docs/api.md                             | 10 +++++++
+ shop/api/routes/admin/__init__.py       |  3 +-
+ shop/api/routes/admin/discount_codes.py | 18 ++++++++++++
+ shop/api/schemas/admin.py               | 24 +++++++++++++++-
+ tests/api/test_admin_api.py             | 38 +++++++++++++++++++++++++
+ 6 files changed, 93 insertions(+), 2 deletions(-)
+ create mode 100644 shop/api/routes/admin/discount_codes.py
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f8cf383..a3d75b1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,8 @@
+ 
+ ## Unreleased
+ 
++- Added discount codes: staff can create a percentage-off code, with an optional expiry date, with `POST /admin/discount-codes`.
++
+ ## 0.7.0
+ 
+ - Added employee discounts: staff can give a customer account a percentage off with `PUT /admin/customers/{id}/employee-discount`. It shows on orders as an adjustment of kind `employee`.
+diff --git a/docs/api.md b/docs/api.md
+index cab8604..27659c3 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -46,6 +46,7 @@ audit log.
+ | `GET`  | `/admin/orders/{id}`                      |                                                       |
+ | `POST` | `/admin/orders/{id}/dispatch`             |                                                       |
+ | `PUT`  | `/admin/customers/{id}/employee-discount` | `{"percent"}`, from 0 to 50.                          |
++| `POST` | `/admin/discount-codes`                   | `{"code", "percent", "expires_on"}`. See below.       |
+ | `GET`  | `/admin/audit?subject=&limit=`            | Newest first.                                         |
+ 
+ ## Pricing
+@@ -59,3 +60,12 @@ audit log.
+   least £50.
+ - Loyalty points are earned at 1 per whole pound paid for merchandise, and can
+   pay for up to half the merchandise at 1p each.
++
++## Discount codes
++
++- A code is 3 to 20 letters, digits or hyphens. Codes aren't case-sensitive:
++  they're stored and returned in upper case. Creating a code that already exists
++  is a `conflict`.
++- `percent` is from 1 to 100.
++- `expires_on` is optional, e.g. `"2026-08-31"`. The code works until the end
++  of that day, UK time. It can't be in the past.
+diff --git a/shop/api/routes/admin/__init__.py b/shop/api/routes/admin/__init__.py
+index 4e5cedc..bf7db0b 100644
+--- a/shop/api/routes/admin/__init__.py
++++ b/shop/api/routes/admin/__init__.py
+@@ -3,10 +3,11 @@
+ from fastapi import APIRouter, Depends
+ 
+ from shop.api.deps import require_staff
+-from shop.api.routes.admin import audit, customers, orders, products
++from shop.api.routes.admin import audit, customers, discount_codes, orders, products
+ 
+ router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_staff)])
+ router.include_router(products.router)
+ router.include_router(orders.router)
+ router.include_router(customers.router)
++router.include_router(discount_codes.router)
+ router.include_router(audit.router)
+diff --git a/shop/api/routes/admin/discount_codes.py b/shop/api/routes/admin/discount_codes.py
+new file mode 100644
+index 0000000..44620b2
+--- /dev/null
++++ b/shop/api/routes/admin/discount_codes.py
+@@ -0,0 +1,18 @@
++from fastapi import APIRouter, Depends
++
++from shop.api.deps import get_services, require_staff
++from shop.api.schemas.admin import DiscountCodeIn, DiscountCodeOut
++from shop.domain.models import StaffMember
++from shop.services import Services
++
++router = APIRouter(prefix="/discount-codes")
++
++
++@router.post("", status_code=201)
++def create_discount_code(
++    body: DiscountCodeIn,
++    staff: StaffMember = Depends(require_staff),
++    services: Services = Depends(get_services),
++) -> DiscountCodeOut:
++    code = services.discount_codes.create(staff, body.code, body.percent, body.expires_on)
++    return DiscountCodeOut.of(code)
+diff --git a/shop/api/schemas/admin.py b/shop/api/schemas/admin.py
+index e10e784..d6a5e10 100644
+--- a/shop/api/schemas/admin.py
++++ b/shop/api/schemas/admin.py
+@@ -1,7 +1,9 @@
++from datetime import date
++
+ from pydantic import BaseModel, Field, field_validator
+ 
+ from shop.api.schemas.common import check_money
+-from shop.domain.models import AuditEntry
++from shop.domain.models import AuditEntry, DiscountCode
+ 
+ 
+ class ProductIn(BaseModel):
+@@ -30,6 +32,26 @@ class EmployeeDiscountIn(BaseModel):
+     percent: int
+ 
+ 
++class DiscountCodeIn(BaseModel):
++    code: str
++    percent: int
++    expires_on: date | None = None
++
++
++class DiscountCodeOut(BaseModel):
++    code: str
++    percent: int
++    expires_on: str | None
++
++    @classmethod
++    def of(cls, code: DiscountCode) -> "DiscountCodeOut":
++        return cls(
++            code=code.code,
++            percent=code.percent,
++            expires_on=code.expires_on.isoformat() if code.expires_on else None,
++        )
++
++
+ class AuditEntryOut(BaseModel):
+     id: int
+     staff_id: int
+diff --git a/tests/api/test_admin_api.py b/tests/api/test_admin_api.py
+index 6c35c13..131d8a6 100644
+--- a/tests/api/test_admin_api.py
++++ b/tests/api/test_admin_api.py
+@@ -16,6 +16,7 @@ def staff_token(make):
+         ("get", "/admin/orders/1"),
+         ("post", "/admin/orders/1/dispatch"),
+         ("put", "/admin/customers/1/employee-discount"),
++        ("post", "/admin/discount-codes"),
+         ("get", "/admin/audit"),
+     ],
+ )
+@@ -95,3 +96,40 @@ def test_employee_discount_unknown_customer(client, staff_token):
+         "/admin/customers/12345/employee-discount", json={"percent": 20}, headers=auth(staff_token)
+     )
+     assert response.status_code == 404
++
++
++def test_create_discount_code(client, staff_token):
++    response = client.post(
++        "/admin/discount-codes",
++        json={"code": "summer10", "percent": 10, "expires_on": "2026-08-31"},
++        headers=auth(staff_token),
++    )
++    assert response.status_code == 201
++    assert response.json() == {"code": "SUMMER10", "percent": 10, "expires_on": "2026-08-31"}
++    [entry] = client.get(
++        "/admin/audit?subject=discount_code:SUMMER10", headers=auth(staff_token)
++    ).json()
++    assert entry["action"] == "discount_code.created"
++
++
++def test_create_discount_code_without_expiry(client, staff_token):
++    response = client.post(
++        "/admin/discount-codes", json={"code": "WELCOME", "percent": 15}, headers=auth(staff_token)
++    )
++    assert response.json()["expires_on"] is None
++
++
++def test_create_discount_code_bad_percent(client, staff_token):
++    response = client.post(
++        "/admin/discount-codes", json={"code": "WELCOME", "percent": 0}, headers=auth(staff_token)
++    )
++    assert response.status_code == 422
++    assert response.json()["error"]["code"] == "validation_failed"
++
++
++def test_create_duplicate_discount_code(client, make, staff_token):
++    make.discount_code("WELCOME")
++    response = client.post(
++        "/admin/discount-codes", json={"code": "WELCOME", "percent": 15}, headers=auth(staff_token)
++    )
++    assert response.status_code == 409
+-- 
+2.54.0 (Apple Git-157)
+

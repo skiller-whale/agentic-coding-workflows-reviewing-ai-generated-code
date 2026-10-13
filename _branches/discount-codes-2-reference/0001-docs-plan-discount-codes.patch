@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 11:28:38 +0200
+Subject: [PATCH 1/6] docs: plan discount codes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .plans/discount-codes-2.md | 40 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+ create mode 100644 .plans/discount-codes-2.md
+
+diff --git a/.plans/discount-codes-2.md b/.plans/discount-codes-2.md
+new file mode 100644
+index 0000000..0234fa6
+--- /dev/null
++++ b/.plans/discount-codes-2.md
+@@ -0,0 +1,40 @@
++# Discount codes
++
++## Request
++
++> Marketing want to run promotions with discount codes.
++> Start with percentage-off codes: staff create them, with an optional expiry date, and customers can enter one at checkout.
++> We'll probably want other kinds of promotion later (a fixed amount off, free shipping, buy one get one free), so bear that in mind.
++
++No later clarifications.
++
++## Commits
++
++No `mech` commits: the new code sits beside the existing code rather than reshaping it.
++
++1. `feat`: add the discount-code domain rules: validating a new code, and turning a code into an order adjustment.
++   - New `DiscountCode` model and `shop/domain/discount_codes.py`, following `employee_discounts.py`.
++   - Codes are 3 to 20 letters and digits, case-insensitive (stored upper case), so `summer10` and `SUMMER10` are the same code.
++   - Percent is 1 to 50, the same cap as employee discounts. Marketing may want more; it's one constant.
++   - The expiry is a date, not a time: a code works until the end of that day in UK time (`Europe/London`), and staff can't create one that has already expired. A new `clock.today()` gives the date in UK time.
++   - The adjustment has kind `discount_code` and a description like `10% off with SUMMER10`, so the order records which code was used.
++   - The percentage is of the merchandise, like the employee discount; it isn't compounded with the other adjustments.
++   - Other kinds of promotion: the code carries a `kind` (only `percent` for now), so a fixed amount off can be another kind of the same code. Free shipping and buy-one-get-one-free don't fit the current `Adjustment` (which only comes off the merchandise), so I'm not designing for them now.
++
++2. `feat`: store discount codes in a new `discount_codes` table.
++   - Migration `008_discount_codes.sql`, a `DiscountCodeRepository`, and a `make.discount_code` factory.
++   - Columns: `code` (primary key), `kind`, `percent` (nullable, so later kinds needn't have one), `expires_on` (ISO date, nullable), `created_at`.
++   - A duplicate code is a `Conflict` (409), like a duplicate SKU.
++
++3. `feat`: let staff create discount codes with `POST /admin/discount-codes`.
++   - Body `{"code", "percent", "expires_on"}`, with `expires_on` optional (`"2026-12-31"`). Returns the code, 201.
++   - Recorded in the audit log as `discount_code.created`, subject `discount_code:<CODE>`.
++   - Only creation, as asked: no listing, editing or ending a code early.
++   - Docs and changelog updated.
++
++4. `feat`: let customers apply a discount code at checkout with `discount_code`.
++   - `POST /checkout` takes an optional `"discount_code"`. An unknown or expired code is a 422 `validation_failed`, so the customer can fix it and try again; the order isn't placed.
++   - A code stacks with the employee discount and loyalty points. Adjustments are listed employee, then discount code, then loyalty.
++   - No usage limits (per customer or overall): not asked for.
++   - The cart preview doesn't show the code's discount; it doesn't show the employee discount or points either.
++   - Docs and changelog updated.
+-- 
+2.54.0 (Apple Git-157)
+

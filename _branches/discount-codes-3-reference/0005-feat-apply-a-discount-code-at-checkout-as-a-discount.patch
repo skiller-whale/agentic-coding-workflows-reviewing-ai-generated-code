@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 11:29:44 +0200
+Subject: [PATCH 5/7] feat: apply a discount code at checkout as a
+ discount_code adjustment
+
+CheckoutService.place_order takes an optional discount_code. An unknown
+or expired code is a ValidationFailed, raised before payment is taken.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ shop/domain/discount_codes.py       | 14 +++++++-
+ shop/services/__init__.py           |  4 ++-
+ shop/services/checkout.py           | 22 ++++++++++--
+ tests/domain/test_discount_codes.py | 20 +++++++++--
+ tests/services/test_checkout.py     | 54 +++++++++++++++++++++++++++++
+ 5 files changed, 107 insertions(+), 7 deletions(-)
+
+diff --git a/shop/domain/discount_codes.py b/shop/domain/discount_codes.py
+index 984b63c..e9519b3 100644
+--- a/shop/domain/discount_codes.py
++++ b/shop/domain/discount_codes.py
+@@ -2,7 +2,8 @@ import re
+ from datetime import date
+ 
+ from shop.domain.errors import ValidationFailed
+-from shop.domain.models import DiscountCode
++from shop.domain.models import Adjustment, DiscountCode
++from shop.domain.money import Money
+ 
+ CODE_PATTERN = re.compile(r"^[A-Z0-9-]{3,20}$")
+ 
+@@ -19,3 +20,14 @@ def check_new_code(code: DiscountCode, today: date) -> None:
+         raise ValidationFailed("Discount codes must be between 1 and 100%")
+     if code.has_expired(today):
+         raise ValidationFailed(f"{code.expires_on} has already passed")
++
++
++def discount(code: DiscountCode, merchandise: Money, today: date) -> Adjustment:
++    """The adjustment for using `code` on an order."""
++    if code.has_expired(today):
++        raise ValidationFailed(f"The discount code {code.code} expired on {code.expires_on}")
++    return Adjustment(
++        kind="discount_code",
++        description=f"{code.code}: {code.percent}% off",
++        amount=merchandise.percent(code.percent),
++    )
+diff --git a/shop/services/__init__.py b/shop/services/__init__.py
+index 54b5710..801c6bb 100644
+--- a/shop/services/__init__.py
++++ b/shop/services/__init__.py
+@@ -50,7 +50,9 @@ class Services:
+             catalog=CatalogService(products, audit),
+             customers=CustomerService(customers, tokens, audit),
+             carts=carts,
+-            checkout=CheckoutService(carts, cart_repo, customers, orders, gateway, settings),
++            checkout=CheckoutService(
++                carts, cart_repo, customers, orders, discount_codes, gateway, settings
++            ),
+             orders=OrderService(orders, customers, audit, gateway),
+             discount_codes=DiscountCodeService(discount_codes, audit),
+             audit=audit,
+diff --git a/shop/services/checkout.py b/shop/services/checkout.py
+index 3f5ace1..fefb6a2 100644
+--- a/shop/services/checkout.py
++++ b/shop/services/checkout.py
+@@ -3,15 +3,16 @@ import logging
+ from shop import clock
+ from shop.config import Settings
+ from shop.db.connection import transaction
+-from shop.domain import loyalty
++from shop.domain import discount_codes, loyalty
+ from shop.domain.employee_discounts import employee_discount
+ from shop.domain.errors import ValidationFailed
+-from shop.domain.models import Customer, Order, OrderStatus
++from shop.domain.models import Adjustment, Customer, Order, OrderStatus
+ from shop.domain.money import Money
+ from shop.domain.pricing import price
+ from shop.payments.gateway import PaymentGateway
+ from shop.repositories.carts import CartRepository
+ from shop.repositories.customers import CustomerRepository
++from shop.repositories.discount_codes import DiscountCodeRepository
+ from shop.repositories.orders import OrderRepository
+ from shop.services.carts import CartService
+ 
+@@ -25,6 +26,7 @@ class CheckoutService:
+         cart_repo: CartRepository,
+         customers: CustomerRepository,
+         orders: OrderRepository,
++        discount_codes: DiscountCodeRepository,
+         gateway: PaymentGateway,
+         settings: Settings,
+     ):
+@@ -32,11 +34,17 @@ class CheckoutService:
+         self.cart_repo = cart_repo
+         self.customers = customers
+         self.orders = orders
++        self.discount_codes = discount_codes
+         self.gateway = gateway
+         self.settings = settings
+ 
+     def place_order(
+-        self, customer: Customer, cart_id: int, payment_token: str, redeem_points: int = 0
++        self,
++        customer: Customer,
++        cart_id: int,
++        payment_token: str,
++        redeem_points: int = 0,
++        discount_code: str | None = None,
+     ) -> Order:
+         cart = self.carts.get(customer, cart_id)
+         if not cart.lines:
+@@ -48,6 +56,8 @@ class CheckoutService:
+         staff_discount = employee_discount(merchandise, customer.employee_discount_percent)
+         if staff_discount:
+             adjustments.append(staff_discount)
++        if discount_code:
++            adjustments.append(self._discount(discount_code, merchandise))
+         if redeem_points:
+             adjustments.append(
+                 loyalty.redemption(
+@@ -87,3 +97,9 @@ class CheckoutService:
+ 
+         log.info("Order %s placed by customer %s for %s", order.id, customer.id, order.total)
+         return order
++
++    def _discount(self, entered: str, merchandise: Money) -> Adjustment:
++        code = self.discount_codes.find(discount_codes.normalise(entered))
++        if code is None:
++            raise ValidationFailed(f"There's no discount code {entered!r}")
++        return discount_codes.discount(code, merchandise, clock.today())
+diff --git a/tests/domain/test_discount_codes.py b/tests/domain/test_discount_codes.py
+index e873840..a69f933 100644
+--- a/tests/domain/test_discount_codes.py
++++ b/tests/domain/test_discount_codes.py
+@@ -2,9 +2,10 @@ from datetime import date
+ 
+ import pytest
+ 
+-from shop.domain.discount_codes import check_new_code, normalise
++from shop.domain.discount_codes import check_new_code, discount, normalise
+ from shop.domain.errors import ValidationFailed
+-from shop.domain.models import DiscountCode
++from shop.domain.models import Adjustment, DiscountCode
++from shop.domain.money import Money
+ 
+ TODAY = date(2026, 6, 15)
+ 
+@@ -38,3 +39,18 @@ def test_cant_create_an_expired_code():
+     check_new_code(DiscountCode("LASTDAY", 10, expires_on=TODAY), TODAY)
+     with pytest.raises(ValidationFailed, match="already passed"):
+         check_new_code(DiscountCode("TOOLATE", 10, expires_on=date(2026, 6, 14)), TODAY)
++
++
++def test_discount():
++    adjustment = discount(DiscountCode("SUMMER10", 10), Money(1565), TODAY)
++    assert adjustment == Adjustment("discount_code", "SUMMER10: 10% off", Money(157))
++
++
++def test_discount_on_the_last_day():
++    assert discount(DiscountCode("LASTDAY", 10, expires_on=TODAY), Money(2000), TODAY)
++
++
++def test_expired_discount():
++    code = DiscountCode("OLD", 10, expires_on=date(2026, 6, 14))
++    with pytest.raises(ValidationFailed, match="expired on 2026-06-14"):
++        discount(code, Money(2000), TODAY)
+diff --git a/tests/services/test_checkout.py b/tests/services/test_checkout.py
+index 184f94b..a274876 100644
+--- a/tests/services/test_checkout.py
++++ b/tests/services/test_checkout.py
+@@ -1,3 +1,5 @@
++from datetime import date
++
+ import pytest
+ 
+ from shop.domain.errors import NotFound, PaymentDeclined, ValidationFailed
+@@ -95,3 +97,55 @@ def test_someone_elses_cart(services, make):
+     bob, _ = make.customer()
+     with pytest.raises(NotFound):
+         services.checkout.place_order(bob, make.cart(alice, ("TEE", 1)), "tok_visa")
++
++
++def test_discount_code(services, make):
++    make.product("TEE", price="20.00")
++    customer, _ = make.customer()
++    make.discount_code("SUMMER10", percent=10)
++    cart_id = make.cart(customer, ("TEE", 1))
++
++    order = services.checkout.place_order(customer, cart_id, "tok_visa", discount_code="summer10")
++
++    assert [(a.kind, a.description, a.amount) for a in order.adjustments] == [
++        ("discount_code", "SUMMER10: 10% off", Money(200))
++    ]
++    assert order.total == Money(1800 + 495)
++    assert order.loyalty_points_earned == 18
++
++
++def test_discount_code_stacks_with_employee_discount_and_loyalty(services, make):
++    make.product("HOODIE", price="55.00")
++    customer, _ = make.customer(loyalty=1000, employee_discount=20)
++    make.discount_code("SUMMER10", percent=10)
++    cart_id = make.cart(customer, ("HOODIE", 1))
++
++    order = services.checkout.place_order(
++        customer, cart_id, "tok_visa", redeem_points=1000, discount_code="SUMMER10"
++    )
++
++    assert [(a.kind, a.amount) for a in order.adjustments] == [
++        ("employee", Money(1100)),
++        ("discount_code", Money(550)),
++        ("loyalty", Money(1000)),
++    ]
++    assert order.total == Money(2850)
++
++
++def test_unknown_discount_code(services, make):
++    make.product("TEE")
++    customer, _ = make.customer()
++    cart_id = make.cart(customer, ("TEE", 1))
++    with pytest.raises(ValidationFailed, match="no discount code 'NOPE'"):
++        services.checkout.place_order(customer, cart_id, "tok_visa", discount_code="NOPE")
++
++
++def test_expired_discount_code_changes_nothing(services, make, gateway):
++    make.product("TEE")
++    customer, _ = make.customer()
++    make.discount_code("SPRING", expires_on=date(2026, 5, 31))
++    cart_id = make.cart(customer, ("TEE", 1))
++    with pytest.raises(ValidationFailed, match="expired"):
++        services.checkout.place_order(customer, cart_id, "tok_visa", discount_code="SPRING")
++    assert gateway.charges == {}
++    assert services.carts.get(customer, cart_id).lines
+-- 
+2.54.0 (Apple Git-157)
+

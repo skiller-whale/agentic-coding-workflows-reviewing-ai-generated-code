@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 11:29:24 +0200
+Subject: [PATCH 3/6] feat: store discount codes in a discount_codes table
+
+Adds migration 008, DiscountCodeRepository and a make.discount_code factory.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ shop/db/migrations/008_discount_codes.sql |  8 +++++
+ shop/repositories/discount_codes.py       | 36 +++++++++++++++++++++++
+ tests/db/test_discount_codes.py           | 25 ++++++++++++++++
+ tests/factories.py                        | 14 ++++++++-
+ 4 files changed, 82 insertions(+), 1 deletion(-)
+ create mode 100644 shop/db/migrations/008_discount_codes.sql
+ create mode 100644 shop/repositories/discount_codes.py
+ create mode 100644 tests/db/test_discount_codes.py
+
+diff --git a/shop/db/migrations/008_discount_codes.sql b/shop/db/migrations/008_discount_codes.sql
+new file mode 100644
+index 0000000..4c42c01
+--- /dev/null
++++ b/shop/db/migrations/008_discount_codes.sql
+@@ -0,0 +1,8 @@
++CREATE TABLE discount_codes (
++    code TEXT PRIMARY KEY,
++    kind TEXT NOT NULL,
++    -- For kind 'percent'. Nullable so that later kinds needn't have one.
++    percent INTEGER,
++    expires_on TEXT,
++    created_at TEXT NOT NULL
++);
+diff --git a/shop/repositories/discount_codes.py b/shop/repositories/discount_codes.py
+new file mode 100644
+index 0000000..00f4b57
+--- /dev/null
++++ b/shop/repositories/discount_codes.py
+@@ -0,0 +1,36 @@
++from datetime import date
++
++from shop.domain.errors import Conflict, NotFound
++from shop.domain.models import DiscountCode
++from shop.repositories.base import Repository, from_db_time, to_db_time
++
++
++class DiscountCodeRepository(Repository):
++    def get(self, code: str) -> DiscountCode:
++        row = self.conn.execute("SELECT * FROM discount_codes WHERE code = ?", (code,)).fetchone()
++        if row is None:
++            raise NotFound(f"No discount code {code!r}")
++        return DiscountCode(
++            code=row["code"],
++            kind=row["kind"],
++            percent=row["percent"],
++            expires_on=date.fromisoformat(row["expires_on"]) if row["expires_on"] else None,
++            created_at=from_db_time(row["created_at"]),
++        )
++
++    def add(self, code: DiscountCode) -> None:
++        if self.conn.execute(
++            "SELECT 1 FROM discount_codes WHERE code = ?", (code.code,)
++        ).fetchone():
++            raise Conflict(f"There's already a discount code {code.code!r}")
++        self.conn.execute(
++            "INSERT INTO discount_codes (code, kind, percent, expires_on, created_at)"
++            " VALUES (?, ?, ?, ?, ?)",
++            (
++                code.code,
++                code.kind,
++                code.percent,
++                code.expires_on.isoformat() if code.expires_on else None,
++                to_db_time(code.created_at),
++            ),
++        )
+diff --git a/tests/db/test_discount_codes.py b/tests/db/test_discount_codes.py
+new file mode 100644
+index 0000000..c10b614
+--- /dev/null
++++ b/tests/db/test_discount_codes.py
+@@ -0,0 +1,25 @@
++from datetime import date
++
++import pytest
++
++from shop.domain.errors import Conflict, NotFound
++from shop.repositories.discount_codes import DiscountCodeRepository
++
++
++def test_discount_codes_round_trip(conn, make):
++    with_expiry = make.discount_code("SUMMER10", percent=10, expires_on=date(2026, 8, 31))
++    without = make.discount_code("FOREVER5", percent=5)
++    repo = DiscountCodeRepository(conn)
++    assert repo.get("SUMMER10") == with_expiry
++    assert repo.get("FOREVER5") == without
++
++
++def test_duplicate_discount_code(make):
++    make.discount_code("SUMMER10")
++    with pytest.raises(Conflict):
++        make.discount_code("SUMMER10")
++
++
++def test_unknown_discount_code(conn):
++    with pytest.raises(NotFound):
++        DiscountCodeRepository(conn).get("NOPE")
+diff --git a/tests/factories.py b/tests/factories.py
+index e1c3184..6de870b 100644
+--- a/tests/factories.py
++++ b/tests/factories.py
+@@ -2,12 +2,15 @@
+ 
+ import itertools
+ import sqlite3
++from datetime import date
+ 
+ from shop import clock
+-from shop.domain.models import Customer, Product, StaffMember
++from shop.domain.discount_codes import PERCENT
++from shop.domain.models import Customer, DiscountCode, Product, StaffMember
+ from shop.domain.money import Money
+ from shop.repositories.carts import CartRepository
+ from shop.repositories.customers import CustomerRepository, StaffRepository, TokenRepository
++from shop.repositories.discount_codes import DiscountCodeRepository
+ from shop.repositories.products import ProductRepository
+ 
+ _ids = itertools.count(1)
+@@ -66,3 +69,12 @@ class Factories:
+         for sku, quantity in lines:
+             repo.set_line(cart_id, sku, quantity)
+         return cart_id
++
++    def discount_code(
++        self, code: str = "SUMMER10", percent: int = 10, expires_on: date | None = None
++    ) -> DiscountCode:
++        discount_code = DiscountCode(
++            code=code, kind=PERCENT, percent=percent, expires_on=expires_on, created_at=clock.now()
++        )
++        DiscountCodeRepository(self.conn).add(discount_code)
++        return discount_code
+-- 
+2.54.0 (Apple Git-157)
+

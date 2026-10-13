@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 11:30:58 +0200
+Subject: [PATCH 6/6] docs: summarise discount codes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .plans/discount-codes-2.md | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/.plans/discount-codes-2.md b/.plans/discount-codes-2.md
+index 0234fa6..87d1a1e 100644
+--- a/.plans/discount-codes-2.md
++++ b/.plans/discount-codes-2.md
+@@ -38,3 +38,19 @@ No `mech` commits: the new code sits beside the existing code rather than reshap
+    - No usage limits (per customer or overall): not asked for.
+    - The cart preview doesn't show the code's discount; it doesn't show the employee discount or points either.
+    - Docs and changelog updated.
++
++## Summary
++
++The plan held. Four `feat` commits, no `mech` ones.
++
++Staff create percentage-off codes with `POST /admin/discount-codes` (`{"code", "percent", "expires_on"}`); creating one is recorded in the audit log. Customers enter a code at checkout with `discount_code`, and it shows on the order as an adjustment of kind `discount_code` (e.g. `10% off with SUMMER10`). The codes are stored in a new `discount_codes` table (migration 008). The API docs and changelog are updated.
++
++Decisions to check:
++
++- **Percent is 1 to 50.** I used the same cap as employee discounts. It's `MAX_PERCENT` in `shop/domain/discount_codes.py`.
++- **Expiry is a date, inclusive, in UK time.** A code works until the end of its `expires_on` day in `Europe/London` (new `clock.today()`). Staff can't create a code whose expiry date has already passed.
++- **Codes are case-insensitive.** They're stored in upper case, and are 3 to 20 letters and digits.
++- **Codes stack.** A code works alongside an employee discount and loyalty points, and each percentage is of the merchandise. An employee with 50% off, using a 50% code and redeeming points, would go over the merchandise. They get the existing 422 "Adjustments can't come to more than the merchandise".
++- **Unknown or expired codes are a 422** (`validation_failed`), not a 404, and nothing is charged.
++- **Built for later kinds, but only lightly.** Codes have a `kind` column (only `percent` for now), and `percent` is nullable in the table. That lets a fixed amount off become another kind without a new table. Free shipping and buy-one-get-one-free don't fit `Adjustment`, which only comes off the merchandise, so I didn't design for them.
++- **Not built:** listing, editing or ending codes early; usage limits; showing the code in the cart preview (which doesn't show the other discounts either).
+-- 
+2.54.0 (Apple Git-157)
+

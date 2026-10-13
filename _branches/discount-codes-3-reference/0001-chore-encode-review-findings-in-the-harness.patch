@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 11:27:07 +0200
+Subject: [PATCH 1/7] chore: encode review findings in the harness
+
+---
+ .claude/agents/maintainer-review.md | 12 +++-
+ .claude/settings.json               | 21 +++++++
+ CLAUDE.md                           | 15 +++++
+ scripts/conventions.py              | 92 +++++++++++++++++++++++++++++
+ 4 files changed, 138 insertions(+), 2 deletions(-)
+ create mode 100644 scripts/conventions.py
+
+diff --git a/.claude/agents/maintainer-review.md b/.claude/agents/maintainer-review.md
+index c1dface..d13a91b 100644
+--- a/.claude/agents/maintainer-review.md
++++ b/.claude/agents/maintainer-review.md
+@@ -1,6 +1,6 @@
+ ---
+ name: maintainer-review
+-description: Reviews a change the way this codebase's maintainers would. Only use when the user explicitly asks for a maintainer review.
++description: Reviews a finished change the way this codebase's maintainers would, before it's handed over. Use after completing any feature or significant change.
+ tools: Read, Grep, Glob, Bash
+ ---
+ 
+@@ -8,10 +8,18 @@ You are a maintainer of this codebase, reviewing a colleague's change before it'
+ Run `git diff main...HEAD` to see the committed change, and `git status` and `git diff HEAD` for any work not yet committed.
+ Don't edit anything: report findings only.
+ 
++Read the plan for the change, in `.plans/`.
++It starts with the request, quoted exactly: that's what the change is for.
++The rest of the plan, and the summary at its end, are the author's account of its own work: claims to check, not facts.
++
+ Judge whether the change belongs in this codebase, not just whether it works.
+ Before judging the new code, read the existing code it sits next to, and compare:
+ 
+-- **Conventions**: does the change follow how the codebase already does things (layering, errors, money, staff actions and the audit log, migrations, adjustments, docs and changelog, tests and factories)?
++- **Intent**: does the change do what the request asked for, and no more?
++  Check each decision the plan lists: did the request settle it, and if not, is it the choice the request's author would most likely expect?
++  Does the code do what the plan says?
++  And look for decisions the code makes that the plan doesn't list.
++- **Conventions** in CLAUDE.md: layering, errors, money, staff actions and the audit log, migrations, adjustments, docs and changelog, tests and factories. Check each one.
+ - **One way of doing things**: does the change add a second mechanism for something the codebase already does?
+ - **Scope**: does it change anything the task didn't need, including how existing features behave?
+ - **Over-engineering**: abstractions, registries or configuration for needs nobody has confirmed.
+diff --git a/.claude/settings.json b/.claude/settings.json
+index 8afbc1e..827f834 100644
+--- a/.claude/settings.json
++++ b/.claude/settings.json
+@@ -10,6 +10,27 @@
+           }
+         ]
+       }
++    ],
++    "PostToolUse": [
++      {
++        "matcher": "Edit|Write",
++        "hooks": [
++          {
++            "type": "command",
++            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/conventions.py\" file"
++          }
++        ]
++      }
++    ],
++    "Stop": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/conventions.py\" stop"
++          }
++        ]
++      }
+     ]
+   }
+ }
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 36536fc..e2feb0a 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -15,3 +15,18 @@ The API behind a small online shop in the UK.
+ - `shop/repositories/` - database access.
+ - `shop/db/` - the SQLite connection and migrations.
+ - `docs/` - API documentation.
++
++## Conventions
++
++These are how the codebase already works. Follow them, and ask if one doesn't fit.
++
++- **Layers.** Routes are thin: they parse the request, call a service, and build the response from `shop/api/schemas/`. Business rules live in `shop/domain/`, orchestration in `shop/services/`, SQL only in `shop/repositories/`.
++- **Errors.** Raise a `DomainError` subclass from `shop/domain/errors.py`. `shop/api/errors.py` is the only place that maps errors to HTTP statuses: never use `HTTPException` or build error responses in routes.
++- **Money.** Always `Money` (whole pence). No `Decimal`, `float` or `round()` arithmetic on money outside `shop/domain/money.py`.
++- **Staff actions.** Staff endpoints go on the `/admin` router (which requires a staff token), and every change staff make is recorded with `AuditLog.record` in the service.
++- **Schema changes.** Add a new numbered migration in `shop/db/migrations/`. Never edit an existing migration, and never create tables from code.
++- **Price reductions** (employee discounts and loyalty points today) are `Adjustment`s passed to `domain.pricing.price`. Anything else that reduces a price should be an adjustment too, not a new field.
++- **Docs.** Any API change updates `docs/api.md`, and gets a line under "Unreleased" in `CHANGELOG.md`.
++- **Tests** use `tests/factories.py` to set up data, not repositories or SQL.
++- **Scope.** Build what's asked for now. Keep the door open for likely future needs, but don't build frameworks for them.
++- **Comments** explain why, not what. Don't narrate the code.
+diff --git a/scripts/conventions.py b/scripts/conventions.py
+new file mode 100644
+index 0000000..52144cf
+--- /dev/null
++++ b/scripts/conventions.py
+@@ -0,0 +1,92 @@
++"""Convention checks, run by hooks.
++
++    conventions.py file   PostToolUse on Edit|Write: check the file just written.
++    conventions.py stop   Stop: check the change as a whole before finishing.
++
++Exits 2 with the problems on stderr (which the agent sees), or 0 if all is well.
++"""
++
++import json
++import re
++import subprocess
++import sys
++from pathlib import Path
++
++SQL = re.compile(
++    r"\.execute(many|script)?\(|\b(SELECT .* FROM|INSERT INTO|UPDATE \w+ SET|DELETE FROM)\b"
++)
++SCHEMA = re.compile(r"\b(CREATE TABLE|ALTER TABLE|CREATE INDEX)\b", re.I)
++MONEY_MATHS = re.compile(r"\bDecimal\(|\bfloat\(|\bround\(|\.quantize\(")
++
++
++def git(*args):
++    return subprocess.run(["git", *args], capture_output=True, text=True).stdout
++
++
++def exists_on_main(path):
++    return (
++        subprocess.run(["git", "cat-file", "-e", f"main:{path}"], capture_output=True).returncode
++        == 0
++    )
++
++
++def check_file(path: str) -> list[str]:
++    problems = []
++    rel = (
++        str(Path(path).resolve().relative_to(Path.cwd().resolve()))
++        if Path(path).is_absolute()
++        else path
++    )
++    if rel.startswith("shop/db/migrations/") and exists_on_main(rel):
++        problems.append(f"{rel} is an existing migration. Add a new numbered migration instead.")
++    if not rel.endswith(".py") or not rel.startswith("shop/"):
++        return problems
++    text = Path(rel).read_text()
++    for number, line in enumerate(text.splitlines(), 1):
++        where = f"{rel}:{number}"
++        if "HTTPException" in line and rel != "shop/api/errors.py":
++            problems.append(
++                f"{where}: raise a DomainError instead; shop/api/errors.py maps it to HTTP."
++            )
++        if SQL.search(line) and not rel.startswith(("shop/repositories/", "shop/db/")):
++            problems.append(f"{where}: SQL belongs in shop/repositories/.")
++        if SCHEMA.search(line) and not rel.startswith("shop/db/migrations/"):
++            problems.append(f"{where}: schema changes belong in a new migration.")
++        if MONEY_MATHS.search(line) and rel not in (
++            "shop/domain/money.py",
++            "shop/api/schemas/common.py",
++        ):
++            problems.append(f"{where}: use Money for money arithmetic.")
++    return problems
++
++
++def check_stop() -> list[str]:
++    git("add", "-A", "--intent-to-add")
++    changed = set(git("diff", "--name-only", "main").split())
++    problems = []
++    if any(p.startswith("shop/api/") for p in changed):
++        if "docs/api.md" not in changed:
++            problems.append("The API changed, so update docs/api.md.")
++        if "CHANGELOG.md" not in changed:
++            problems.append('The API changed, so add a line under "Unreleased" in CHANGELOG.md.')
++    for path in sorted(changed):
++        if Path(path).exists():
++            problems.extend(check_file(path))
++    return problems
++
++
++def main():
++    mode = sys.argv[1]
++    hook_input = json.load(sys.stdin)
++    if mode == "file":
++        path = hook_input.get("tool_input", {}).get("file_path", "")
++        problems = check_file(path) if path else []
++    else:
++        problems = check_stop()
++    if problems:
++        print("\n".join(problems), file=sys.stderr)
++        sys.exit(2)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.54.0 (Apple Git-157)
+

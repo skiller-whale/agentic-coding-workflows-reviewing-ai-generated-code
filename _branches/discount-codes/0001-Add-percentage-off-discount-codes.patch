@@ -1,0 +1,910 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 2 Oct 2026 12:05:00 +0100
+Subject: [PATCH] Add percentage-off discount codes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Staff can now create percentage-off discount codes with an optional expiry date, and customers can enter one at checkout. All 115 tests pass (85 old, 30 new) and ruff is clean.
+
+**How it works**
+- **Staff:** `POST /admin/discount-codes` with `{"code": "summer-20", "kind": "percent_off", "percent": 20, "expires_on": "2026-08-31"}` creates a code, and `GET /admin/discount-codes` lists them. Creating a code is recorded in the audit log, like other staff changes. Codes are 3–30 letters, digits and hyphens, and must be unique (a duplicate gets a 409). The percentage is 1–100, and the expiry date can't already have passed.
+- **Customers:** `POST /checkout` takes a new optional `discount_code`. It shows on the order as an adjustment of kind `discount_code`, e.g. "10% off with SAVE10". A code that doesn't exist or has expired gets a 422 before the card is charged.
+- `docs/api.md` and the changelog are updated, and there's a new migration, `008_discount_codes.sql`.
+
+**Decisions I made that you may want to confirm with Marketing**
+- **Expiry is UK time:** a code works until the end of its expiry date in London time. I added `clock.today()` for this.
+- **Case doesn't matter:** codes are stored in upper case, so `save10` and `SAVE10` are the same code.
+- **Stacking:** codes can be combined with employee discounts and loyalty points. The employee discount comes off first, then the code's percentage of what's left, then loyalty points. Applying the code to what's left means a 50% staff discount plus a 100% code can't come to more than the order. If Marketing want "can't be combined with other offers", that's a small change in checkout.
+- **Admin API:** creating a code requires `kind`, even though `percent_off` is the only kind so far. Future kinds can then be added without breaking anything that already calls the API.
+
+**Making room for other promotions**
+- Each kind of code is a subclass of `DiscountCode` in `shop/domain/discount_codes.py`. The table has a `kind` column, plus columns that only apply to some kinds.
+- A fixed amount off would be a new subclass, a column, and one more case in the repository and request schema.
+- Buy one get one free will need the order lines passed in, not just a total.
+- Free shipping is the odd one out: everything that comes off an order today comes off the merchandise, so free shipping will need a change to `price()`. I didn't build that ahead of time.
+
+**Not included, but likely to come up**
+- **Usage limits:** there's no once-per-customer rule and no maximum number of uses.
+- **Managing codes:** there's no way to switch a code off early or edit it.
+- **Cart preview:** the cart preview doesn't show the discount. It doesn't show the employee discount either.
+- **Reporting:** orders don't store which code was used as its own field. The code is only in the adjustment's description, which makes reports on promotions harder; a column on `order_adjustments` would fix that.
+---
+ CHANGELOG.md                              |  2 +
+ docs/api.md                               | 34 ++++++++----
+ shop/api/routes/admin/__init__.py         |  3 +-
+ shop/api/routes/admin/discount_codes.py   | 22 ++++++++
+ shop/api/routes/orders.py                 |  6 ++-
+ shop/api/schemas/admin.py                 | 34 ++++++++++++
+ shop/api/schemas/orders.py                |  1 +
+ shop/clock.py                             |  7 ++-
+ shop/db/migrations/008_discount_codes.sql |  8 +++
+ shop/domain/discount_codes.py             | 66 +++++++++++++++++++++++
+ shop/repositories/discount_codes.py       | 53 ++++++++++++++++++
+ shop/services/__init__.py                 |  9 +++-
+ shop/services/checkout.py                 | 20 ++++++-
+ shop/services/discount_codes.py           | 50 +++++++++++++++++
+ tests/api/test_admin_api.py               | 56 +++++++++++++++++++
+ tests/api/test_checkout_api.py            | 35 ++++++++++++
+ tests/domain/test_discount_codes.py       | 50 +++++++++++++++++
+ tests/factories.py                        | 10 ++++
+ tests/services/test_checkout.py           | 46 ++++++++++++++++
+ tests/services/test_discount_codes.py     | 58 ++++++++++++++++++++
+ 20 files changed, 555 insertions(+), 15 deletions(-)
+ create mode 100644 shop/api/routes/admin/discount_codes.py
+ create mode 100644 shop/db/migrations/008_discount_codes.sql
+ create mode 100644 shop/domain/discount_codes.py
+ create mode 100644 shop/repositories/discount_codes.py
+ create mode 100644 shop/services/discount_codes.py
+ create mode 100644 tests/domain/test_discount_codes.py
+ create mode 100644 tests/services/test_discount_codes.py
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f8cf383..d6d9e13 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,8 @@
+ 
+ ## Unreleased
+ 
++- Added discount codes. Staff create percentage-off codes, optionally with an expiry date, with `POST /admin/discount-codes`, and list them with `GET /admin/discount-codes`. Customers enter one at checkout with `discount_code`. It shows on orders as an adjustment of kind `discount_code`.
++
+ ## 0.7.0
+ 
+ - Added employee discounts: staff can give a customer account a percentage off with `PUT /admin/customers/{id}/employee-discount`. It shows on orders as an adjustment of kind `employee`.
+diff --git a/docs/api.md b/docs/api.md
+index cab8604..d71b61f 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -23,16 +23,16 @@ Authenticate with `Authorization: Bearer <token>`. Errors look like
+ 
+ ## Customers
+ 
+-| Method | Path                      | Notes                                                               |
+-| ------ | ------------------------- | ------------------------------------------------------------------- |
+-| `GET`  | `/customers/me`           | Includes `loyalty_balance` and `employee_discount_percent`.         |
+-| `POST` | `/carts`                  | Create an empty cart.                                               |
+-| `GET`  | `/carts/{id}`             | Lines, and a price preview.                                         |
+-| `PUT`  | `/carts/{id}/lines/{sku}` | `{"quantity"}`; 0 removes the line.                                 |
+-| `POST` | `/checkout`               | `{"cart_id", "payment_token", "redeem_points"}`. Returns the order. |
+-| `GET`  | `/orders`                 | The customer's orders, newest first.                                |
+-| `GET`  | `/orders/{id}`            |                                                                     |
+-| `POST` | `/orders/{id}/cancel`     | Until dispatched; refunds in full.                                  |
++| Method | Path                      | Notes                                                                                |
++| ------ | ------------------------- | ------------------------------------------------------------------------------------ |
++| `GET`  | `/customers/me`           | Includes `loyalty_balance` and `employee_discount_percent`.                          |
++| `POST` | `/carts`                  | Create an empty cart.                                                                |
++| `GET`  | `/carts/{id}`             | Lines, and a price preview.                                                          |
++| `PUT`  | `/carts/{id}/lines/{sku}` | `{"quantity"}`; 0 removes the line.                                                  |
++| `POST` | `/checkout`               | `{"cart_id", "payment_token", "redeem_points", "discount_code"}`. Returns the order. |
++| `GET`  | `/orders`                 | The customer's orders, newest first.                                                 |
++| `GET`  | `/orders/{id}`            |                                                                                      |
++| `POST` | `/orders/{id}/cancel`     | Until dispatched; refunds in full.                                                   |
+ 
+ ## Staff
+ 
+@@ -46,13 +46,27 @@ audit log.
+ | `GET`  | `/admin/orders/{id}`                      |                                                       |
+ | `POST` | `/admin/orders/{id}/dispatch`             |                                                       |
+ | `PUT`  | `/admin/customers/{id}/employee-discount` | `{"percent"}`, from 0 to 50.                          |
++| `GET`  | `/admin/discount-codes`                   |                                                       |
++| `POST` | `/admin/discount-codes`                   | See below.                                            |
+ | `GET`  | `/admin/audit?subject=&limit=`            | Newest first.                                         |
+ 
++### Discount codes
++
++`POST /admin/discount-codes` takes `{"code", "kind", "expires_on", ...}`:
++
++- `code` is 3 to 30 letters, digits and hyphens. Codes aren't case-sensitive, and
++  are stored in upper case.
++- `expires_on` is optional. It's the last date (UK time) the code can be used,
++  e.g. `"2026-08-31"`.
++- `kind` is `percent_off` for now. It needs `percent`, from 1 to 100.
++
+ ## Pricing
+ 
+ - `merchandise` is the sum of the lines.
+ - `adjustments` come off the merchandise before tax. Each has a `kind`:
+   - `employee`: staff get their `employee_discount_percent` off the merchandise.
++  - `discount_code`: a code entered at checkout. A `percent_off` code comes off
++    the merchandise after the employee discount.
+   - `loyalty`: redeemed loyalty points.
+ - Prices include VAT, so `tax` is the VAT included in the total.
+ - Shipping is £4.95, and free when the merchandise, before adjustments, is at
+diff --git a/shop/api/routes/admin/__init__.py b/shop/api/routes/admin/__init__.py
+index 4e5cedc..bf7db0b 100644
+--- a/shop/api/routes/admin/__init__.py
++++ b/shop/api/routes/admin/__init__.py
+@@ -3,10 +3,11 @@
+ from fastapi import APIRouter, Depends
+ 
+ from shop.api.deps import require_staff
+-from shop.api.routes.admin import audit, customers, orders, products
++from shop.api.routes.admin import audit, customers, discount_codes, orders, products
+ 
+ router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_staff)])
+ router.include_router(products.router)
+ router.include_router(orders.router)
+ router.include_router(customers.router)
++router.include_router(discount_codes.router)
+ router.include_router(audit.router)
+diff --git a/shop/api/routes/admin/discount_codes.py b/shop/api/routes/admin/discount_codes.py
+new file mode 100644
+index 0000000..3be7ac5
+--- /dev/null
++++ b/shop/api/routes/admin/discount_codes.py
+@@ -0,0 +1,22 @@
++from fastapi import APIRouter, Depends
++
++from shop.api.deps import get_services, require_staff
++from shop.api.schemas.admin import DiscountCodeIn, DiscountCodeOut
++from shop.domain.models import StaffMember
++from shop.services import Services
++
++router = APIRouter(prefix="/discount-codes")
++
++
++@router.get("")
++def list_discount_codes(services: Services = Depends(get_services)) -> list[DiscountCodeOut]:
++    return [DiscountCodeOut.of(code) for code in services.discount_codes.list()]
++
++
++@router.post("", status_code=201)
++def create_discount_code(
++    body: DiscountCodeIn,
++    staff: StaffMember = Depends(require_staff),
++    services: Services = Depends(get_services),
++) -> DiscountCodeOut:
++    return DiscountCodeOut.of(services.discount_codes.create(staff, body.to_domain()))
+diff --git a/shop/api/routes/orders.py b/shop/api/routes/orders.py
+index 6b074bc..1fa6f87 100644
+--- a/shop/api/routes/orders.py
++++ b/shop/api/routes/orders.py
+@@ -15,7 +15,11 @@ def checkout(
+     services: Services = Depends(get_services),
+ ) -> OrderOut:
+     order = services.checkout.place_order(
+-        customer, body.cart_id, body.payment_token, redeem_points=body.redeem_points
++        customer,
++        body.cart_id,
++        body.payment_token,
++        redeem_points=body.redeem_points,
++        discount_code=body.discount_code,
+     )
+     return OrderOut.of(order)
+ 
+diff --git a/shop/api/schemas/admin.py b/shop/api/schemas/admin.py
+index e10e784..eaf2416 100644
+--- a/shop/api/schemas/admin.py
++++ b/shop/api/schemas/admin.py
+@@ -1,6 +1,10 @@
++from datetime import date
++from typing import Literal
++
+ from pydantic import BaseModel, Field, field_validator
+ 
+ from shop.api.schemas.common import check_money
++from shop.domain.discount_codes import DiscountCode, PercentOff
+ from shop.domain.models import AuditEntry
+ 
+ 
+@@ -30,6 +34,36 @@ class EmployeeDiscountIn(BaseModel):
+     percent: int
+ 
+ 
++class DiscountCodeIn(BaseModel):
++    """Only percentage codes so far. Other kinds will be a union discriminated on `kind`."""
++
++    code: str
++    kind: Literal["percent_off"]
++    percent: int
++    expires_on: date | None = None
++
++    def to_domain(self) -> DiscountCode:
++        return PercentOff(code=self.code, expires_on=self.expires_on, percent=self.percent)
++
++
++class DiscountCodeOut(BaseModel):
++    code: str
++    kind: str
++    expires_on: str | None
++    percent: int | None = None
++
++    @classmethod
++    def of(cls, discount_code: DiscountCode) -> "DiscountCodeOut":
++        out = cls(
++            code=discount_code.code,
++            kind=discount_code.kind,
++            expires_on=discount_code.expires_on.isoformat() if discount_code.expires_on else None,
++        )
++        if isinstance(discount_code, PercentOff):
++            out.percent = discount_code.percent
++        return out
++
++
+ class AuditEntryOut(BaseModel):
+     id: int
+     staff_id: int
+diff --git a/shop/api/schemas/orders.py b/shop/api/schemas/orders.py
+index a5dd629..e3ca746 100644
+--- a/shop/api/schemas/orders.py
++++ b/shop/api/schemas/orders.py
+@@ -8,6 +8,7 @@ class CheckoutIn(BaseModel):
+     cart_id: int
+     payment_token: str
+     redeem_points: int = Field(default=0, ge=0)
++    discount_code: str | None = None
+ 
+ 
+ class OrderLineOut(BaseModel):
+diff --git a/shop/clock.py b/shop/clock.py
+index 857b271..7bac3ce 100644
+--- a/shop/clock.py
++++ b/shop/clock.py
+@@ -1,4 +1,4 @@
+-from datetime import UTC, datetime
++from datetime import UTC, date, datetime
+ from zoneinfo import ZoneInfo
+ 
+ SHOP_TIMEZONE = ZoneInfo("Europe/London")
+@@ -7,3 +7,8 @@ SHOP_TIMEZONE = ZoneInfo("Europe/London")
+ def now() -> datetime:
+     """The current time, in UTC. Tests freeze this."""
+     return datetime.now(UTC)
++
++
++def today() -> date:
++    """Today's date in the shop's timezone."""
++    return now().astimezone(SHOP_TIMEZONE).date()
+diff --git a/shop/db/migrations/008_discount_codes.sql b/shop/db/migrations/008_discount_codes.sql
+new file mode 100644
+index 0000000..bcc4937
+--- /dev/null
++++ b/shop/db/migrations/008_discount_codes.sql
+@@ -0,0 +1,8 @@
++-- Each kind of code has its own columns, which are NULL for the other kinds.
++CREATE TABLE discount_codes (
++    code TEXT PRIMARY KEY,
++    kind TEXT NOT NULL,
++    expires_on TEXT,
++    percent INTEGER CHECK (percent BETWEEN 1 AND 100),
++    CHECK (kind <> 'percent_off' OR percent IS NOT NULL)
++);
+diff --git a/shop/domain/discount_codes.py b/shop/domain/discount_codes.py
+new file mode 100644
+index 0000000..9fe7885
+--- /dev/null
++++ b/shop/domain/discount_codes.py
+@@ -0,0 +1,66 @@
++"""Discount codes that customers enter at checkout.
++
++Each kind of code is a subclass of DiscountCode, which says what it takes off an order.
++"""
++
++import re
++from dataclasses import dataclass
++from datetime import date
++from typing import ClassVar
++
++from shop.domain.errors import ValidationFailed
++from shop.domain.models import Adjustment
++from shop.domain.money import Money
++
++CODE_PATTERN = re.compile(r"^[A-Z0-9-]{3,30}$")
++
++
++def normalise(code: str) -> str:
++    """Codes are case-insensitive, so they're stored and looked up in upper case."""
++    return code.strip().upper()
++
++
++@dataclass(frozen=True)
++class DiscountCode:
++    code: str
++    # The last day the code can be used, in the shop's timezone. None if it doesn't expire.
++    expires_on: date | None
++
++    kind: ClassVar[str]
++
++    def is_live(self, today: date) -> bool:
++        return self.expires_on is None or today <= self.expires_on
++
++    def check(self, today: date) -> None:
++        """Check that staff can create this code."""
++        if not CODE_PATTERN.match(self.code):
++            raise ValidationFailed(
++                "Codes must be 3 to 30 letters, digits and hyphens, e.g. SUMMER-20"
++            )
++        if not self.is_live(today):
++            raise ValidationFailed(f"The expiry date {self.expires_on} has already passed")
++
++    def adjustment(self, discountable: Money) -> Adjustment | None:
++        """What the code takes off `discountable`, the merchandise after the employee
++        discount. None if it takes nothing off."""
++        raise NotImplementedError
++
++
++@dataclass(frozen=True)
++class PercentOff(DiscountCode):
++    percent: int
++
++    kind: ClassVar[str] = "percent_off"
++
++    def check(self, today: date) -> None:
++        super().check(today)
++        if not 1 <= self.percent <= 100:
++            raise ValidationFailed("Percentage discount codes must be between 1 and 100%")
++
++    def adjustment(self, discountable: Money) -> Adjustment | None:
++        amount = discountable.percent(self.percent)
++        if amount.is_zero():
++            return None
++        return Adjustment(
++            kind="discount_code", description=f"{self.percent}% off with {self.code}", amount=amount
++        )
+diff --git a/shop/repositories/discount_codes.py b/shop/repositories/discount_codes.py
+new file mode 100644
+index 0000000..aa461ea
+--- /dev/null
++++ b/shop/repositories/discount_codes.py
+@@ -0,0 +1,53 @@
++from datetime import date
++
++from shop.domain.discount_codes import DiscountCode, PercentOff
++from shop.domain.errors import Conflict, NotFound
++from shop.repositories.base import Repository
++
++
++def _discount_code(row) -> DiscountCode:
++    expires_on = date.fromisoformat(row["expires_on"]) if row["expires_on"] else None
++    match row["kind"]:
++        case PercentOff.kind:
++            return PercentOff(code=row["code"], expires_on=expires_on, percent=row["percent"])
++    raise ValueError(f"Unknown kind of discount code {row['kind']!r}")
++
++
++def _kind_columns(discount_code: DiscountCode) -> dict:
++    match discount_code:
++        case PercentOff(percent=percent):
++            return {"percent": percent}
++    raise ValueError(f"Can't save a {type(discount_code).__name__}")
++
++
++class DiscountCodeRepository(Repository):
++    def get(self, code: str) -> DiscountCode:
++        row = self.conn.execute("SELECT * FROM discount_codes WHERE code = ?", (code,)).fetchone()
++        if row is None:
++            raise NotFound(f"No discount code {code!r}")
++        return _discount_code(row)
++
++    def list(self) -> list[DiscountCode]:
++        return [
++            _discount_code(row)
++            for row in self.conn.execute("SELECT * FROM discount_codes ORDER BY code")
++        ]
++
++    def add(self, discount_code: DiscountCode) -> None:
++        if self.conn.execute(
++            "SELECT 1 FROM discount_codes WHERE code = ?", (discount_code.code,)
++        ).fetchone():
++            raise Conflict(f"There's already a discount code {discount_code.code!r}")
++        columns = {
++            "code": discount_code.code,
++            "kind": discount_code.kind,
++            "expires_on": discount_code.expires_on.isoformat()
++            if discount_code.expires_on
++            else None,
++            **_kind_columns(discount_code),
++        }
++        self.conn.execute(
++            f"INSERT INTO discount_codes ({', '.join(columns)})"
++            f" VALUES ({', '.join('?' for _ in columns)})",
++            list(columns.values()),
++        )
+diff --git a/shop/services/__init__.py b/shop/services/__init__.py
+index ed409f3..a61bae6 100644
+--- a/shop/services/__init__.py
++++ b/shop/services/__init__.py
+@@ -6,6 +6,7 @@ from shop.payments.gateway import PaymentGateway
+ from shop.repositories.audit import AuditRepository
+ from shop.repositories.carts import CartRepository
+ from shop.repositories.customers import CustomerRepository, StaffRepository, TokenRepository
++from shop.repositories.discount_codes import DiscountCodeRepository
+ from shop.repositories.orders import OrderRepository
+ from shop.repositories.products import ProductRepository
+ from shop.services.audit import AuditLog
+@@ -13,6 +14,7 @@ from shop.services.carts import CartService
+ from shop.services.catalog import CatalogService
+ from shop.services.checkout import CheckoutService
+ from shop.services.customers import CustomerService
++from shop.services.discount_codes import DiscountCodeService
+ from shop.services.orders import OrderService
+ 
+ 
+@@ -23,6 +25,7 @@ class Services:
+     settings: Settings
+     catalog: CatalogService
+     customers: CustomerService
++    discount_codes: DiscountCodeService
+     carts: CartService
+     checkout: CheckoutService
+     orders: OrderService
+@@ -41,12 +44,16 @@ class Services:
+         orders = OrderRepository(conn)
+         audit = AuditLog(AuditRepository(conn))
+         carts = CartService(cart_repo, products, settings)
++        discount_codes = DiscountCodeService(DiscountCodeRepository(conn), audit)
+         return cls(
+             settings=settings,
+             catalog=CatalogService(products, audit),
+             customers=CustomerService(customers, tokens, audit),
++            discount_codes=discount_codes,
+             carts=carts,
+-            checkout=CheckoutService(carts, cart_repo, customers, orders, gateway, settings),
++            checkout=CheckoutService(
++                carts, cart_repo, customers, discount_codes, orders, gateway, settings
++            ),
+             orders=OrderService(orders, customers, audit, gateway),
+             audit=audit,
+             staff=StaffRepository(conn),
+diff --git a/shop/services/checkout.py b/shop/services/checkout.py
+index 3f5ace1..0ba753c 100644
+--- a/shop/services/checkout.py
++++ b/shop/services/checkout.py
+@@ -14,6 +14,7 @@ from shop.repositories.carts import CartRepository
+ from shop.repositories.customers import CustomerRepository
+ from shop.repositories.orders import OrderRepository
+ from shop.services.carts import CartService
++from shop.services.discount_codes import DiscountCodeService
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -24,6 +25,7 @@ class CheckoutService:
+         carts: CartService,
+         cart_repo: CartRepository,
+         customers: CustomerRepository,
++        discount_codes: DiscountCodeService,
+         orders: OrderRepository,
+         gateway: PaymentGateway,
+         settings: Settings,
+@@ -31,13 +33,24 @@ class CheckoutService:
+         self.carts = carts
+         self.cart_repo = cart_repo
+         self.customers = customers
++        self.discount_codes = discount_codes
+         self.orders = orders
+         self.gateway = gateway
+         self.settings = settings
+ 
+     def place_order(
+-        self, customer: Customer, cart_id: int, payment_token: str, redeem_points: int = 0
++        self,
++        customer: Customer,
++        cart_id: int,
++        payment_token: str,
++        redeem_points: int = 0,
++        discount_code: str | None = None,
+     ) -> Order:
++        """Charge the customer for their cart and turn it into an order.
++
++        The employee discount comes off first, then the discount code comes off what's left,
++        then loyalty points.
++        """
+         cart = self.carts.get(customer, cart_id)
+         if not cart.lines:
+             raise ValidationFailed("Your cart is empty")
+@@ -48,6 +61,11 @@ class CheckoutService:
+         staff_discount = employee_discount(merchandise, customer.employee_discount_percent)
+         if staff_discount:
+             adjustments.append(staff_discount)
++        if discount_code:
++            discountable = merchandise - Money.sum(adj.amount for adj in adjustments)
++            code_discount = self.discount_codes.for_checkout(discount_code).adjustment(discountable)
++            if code_discount:
++                adjustments.append(code_discount)
+         if redeem_points:
+             adjustments.append(
+                 loyalty.redemption(
+diff --git a/shop/services/discount_codes.py b/shop/services/discount_codes.py
+new file mode 100644
+index 0000000..e30a21d
+--- /dev/null
++++ b/shop/services/discount_codes.py
+@@ -0,0 +1,50 @@
++from dataclasses import asdict, replace
++from datetime import date
++
++from shop import clock
++from shop.db.connection import transaction
++from shop.domain.discount_codes import DiscountCode, normalise
++from shop.domain.errors import NotFound, ValidationFailed
++from shop.domain.models import StaffMember
++from shop.repositories.discount_codes import DiscountCodeRepository
++from shop.services.audit import AuditLog
++
++
++class DiscountCodeService:
++    def __init__(self, codes: DiscountCodeRepository, audit: AuditLog):
++        self.codes = codes
++        self.audit = audit
++
++    def for_checkout(self, code: str) -> DiscountCode:
++        """The code a customer entered, if it exists and hasn't expired."""
++        try:
++            discount_code = self.codes.get(normalise(code))
++        except NotFound:
++            raise ValidationFailed(f"{code!r} isn't a discount code") from None
++        if not discount_code.is_live(clock.today()):
++            raise ValidationFailed(f"The discount code {discount_code.code} has expired")
++        return discount_code
++
++    # --- staff ---
++
++    def list(self) -> list[DiscountCode]:
++        return self.codes.list()
++
++    def create(self, staff: StaffMember, discount_code: DiscountCode) -> DiscountCode:
++        discount_code = replace(discount_code, code=normalise(discount_code.code))
++        discount_code.check(clock.today())
++        details = {
++            name: value.isoformat() if isinstance(value, date) else value
++            for name, value in asdict(discount_code).items()
++            if name != "code"
++        }
++        with transaction(self.codes.conn):
++            self.codes.add(discount_code)
++            self.audit.record(
++                staff,
++                "discount_code.created",
++                f"discount_code:{discount_code.code}",
++                kind=discount_code.kind,
++                **details,
++            )
++        return discount_code
+diff --git a/tests/api/test_admin_api.py b/tests/api/test_admin_api.py
+index 6c35c13..e5ce967 100644
+--- a/tests/api/test_admin_api.py
++++ b/tests/api/test_admin_api.py
+@@ -16,6 +16,8 @@ def staff_token(make):
+         ("get", "/admin/orders/1"),
+         ("post", "/admin/orders/1/dispatch"),
+         ("put", "/admin/customers/1/employee-discount"),
++        ("get", "/admin/discount-codes"),
++        ("post", "/admin/discount-codes"),
+         ("get", "/admin/audit"),
+     ],
+ )
+@@ -95,3 +97,57 @@ def test_employee_discount_unknown_customer(client, staff_token):
+         "/admin/customers/12345/employee-discount", json={"percent": 20}, headers=auth(staff_token)
+     )
+     assert response.status_code == 404
++
++
++def test_create_and_list_discount_codes(client, make, staff_token):
++    response = client.post(
++        "/admin/discount-codes",
++        json={
++            "code": "summer-20",
++            "kind": "percent_off",
++            "percent": 20,
++            "expires_on": "2026-08-31",
++        },
++        headers=auth(staff_token),
++    )
++    assert response.status_code == 201
++    expected = {
++        "code": "SUMMER-20",
++        "kind": "percent_off",
++        "percent": 20,
++        "expires_on": "2026-08-31",
++    }
++    assert response.json() == expected
++    assert client.get("/admin/discount-codes", headers=auth(staff_token)).json() == [expected]
++
++
++def test_discount_code_without_expiry(client, staff_token):
++    response = client.post(
++        "/admin/discount-codes",
++        json={"code": "WELCOME", "kind": "percent_off", "percent": 10},
++        headers=auth(staff_token),
++    )
++    assert response.json()["expires_on"] is None
++
++
++@pytest.mark.parametrize(
++    "body",
++    [
++        {"code": "SAVE", "kind": "percent_off", "percent": 101},
++        {"code": "SAVE", "kind": "percent_off", "percent": 10, "expires_on": "2026-06-14"},
++        {"code": "SAVE", "kind": "fixed_amount_off", "percent": 10},
++    ],
++)
++def test_invalid_discount_code(client, staff_token, body):
++    response = client.post("/admin/discount-codes", json=body, headers=auth(staff_token))
++    assert response.status_code == 422
++
++
++def test_duplicate_discount_code(client, make, staff_token):
++    make.percent_off("SAVE10")
++    response = client.post(
++        "/admin/discount-codes",
++        json={"code": "SAVE10", "kind": "percent_off", "percent": 10},
++        headers=auth(staff_token),
++    )
++    assert response.status_code == 409
+diff --git a/tests/api/test_checkout_api.py b/tests/api/test_checkout_api.py
+index 9ff3d72..c9a6277 100644
+--- a/tests/api/test_checkout_api.py
++++ b/tests/api/test_checkout_api.py
+@@ -100,3 +100,38 @@ def test_other_customers_orders_are_hidden(client, make):
+         headers=auth(alice_token),
+     ).json()
+     assert client.get(f"/orders/{order['id']}", headers=auth(bob_token)).status_code == 404
++
++
++def test_discount_code(client, make):
++    make.product("TEE", price="20.00")
++    make.percent_off("SAVE10", percent=10)
++    customer, token = make.customer()
++    order = client.post(
++        "/checkout",
++        json={
++            "cart_id": make.cart(customer, ("TEE", 1)),
++            "payment_token": "tok_visa",
++            "discount_code": "save10",
++        },
++        headers=auth(token),
++    ).json()
++    assert order["adjustments"] == [
++        {"kind": "discount_code", "description": "10% off with SAVE10", "amount": "2.00"}
++    ]
++    assert order["total"] == "22.95"
++
++
++def test_unknown_discount_code(client, make):
++    make.product("TEE")
++    customer, token = make.customer()
++    response = client.post(
++        "/checkout",
++        json={
++            "cart_id": make.cart(customer, ("TEE", 1)),
++            "payment_token": "tok_visa",
++            "discount_code": "NOPE",
++        },
++        headers=auth(token),
++    )
++    assert response.status_code == 422
++    assert response.json()["error"]["code"] == "validation_failed"
+diff --git a/tests/domain/test_discount_codes.py b/tests/domain/test_discount_codes.py
+new file mode 100644
+index 0000000..c4b092f
+--- /dev/null
++++ b/tests/domain/test_discount_codes.py
+@@ -0,0 +1,50 @@
++from datetime import date
++
++import pytest
++
++from shop.domain.discount_codes import PercentOff, normalise
++from shop.domain.errors import ValidationFailed
++from shop.domain.money import Money
++
++TODAY = date(2026, 6, 15)
++
++
++def test_percent_off():
++    adjustment = PercentOff("SAVE10", None, 10).adjustment(Money(1565))
++    assert adjustment.kind == "discount_code"
++    assert adjustment.description == "10% off with SAVE10"
++    assert adjustment.amount == Money(157)
++
++
++def test_percent_off_of_nothing():
++    assert PercentOff("SAVE10", None, 10).adjustment(Money(0)) is None
++
++
++def test_live_until_the_end_of_the_expiry_date():
++    assert PercentOff("SAVE10", None, 10).is_live(TODAY)
++    assert PercentOff("SAVE10", TODAY, 10).is_live(TODAY)
++    assert not PercentOff("SAVE10", date(2026, 6, 14), 10).is_live(TODAY)
++
++
++def test_normalise():
++    assert normalise(" summer-20 ") == "SUMMER-20"
++
++
++@pytest.mark.parametrize(
++    "discount_code, message",
++    [
++        (PercentOff("SAVE10", None, 0), "between 1 and 100"),
++        (PercentOff("SAVE10", None, 101), "between 1 and 100"),
++        (PercentOff("S", None, 10), "3 to 30"),
++        (PercentOff("SAVE 10", None, 10), "3 to 30"),
++        (PercentOff("SAVE10", date(2026, 6, 14), 10), "already passed"),
++    ],
++)
++def test_check(discount_code, message):
++    with pytest.raises(ValidationFailed, match=message):
++        discount_code.check(TODAY)
++
++
++def test_check_accepts_valid_codes():
++    PercentOff("SAVE10", None, 1).check(TODAY)
++    PercentOff("SUMMER-2026", TODAY, 100).check(TODAY)
+diff --git a/tests/factories.py b/tests/factories.py
+index e1c3184..5b564d7 100644
+--- a/tests/factories.py
++++ b/tests/factories.py
+@@ -2,12 +2,15 @@
+ 
+ import itertools
+ import sqlite3
++from datetime import date
+ 
+ from shop import clock
++from shop.domain.discount_codes import PercentOff
+ from shop.domain.models import Customer, Product, StaffMember
+ from shop.domain.money import Money
+ from shop.repositories.carts import CartRepository
+ from shop.repositories.customers import CustomerRepository, StaffRepository, TokenRepository
++from shop.repositories.discount_codes import DiscountCodeRepository
+ from shop.repositories.products import ProductRepository
+ 
+ _ids = itertools.count(1)
+@@ -66,3 +69,10 @@ class Factories:
+         for sku, quantity in lines:
+             repo.set_line(cart_id, sku, quantity)
+         return cart_id
++
++    def percent_off(
++        self, code: str = "SAVE10", percent: int = 10, expires_on: date | None = None
++    ) -> PercentOff:
++        discount_code = PercentOff(code=code, expires_on=expires_on, percent=percent)
++        DiscountCodeRepository(self.conn).add(discount_code)
++        return discount_code
+diff --git a/tests/services/test_checkout.py b/tests/services/test_checkout.py
+index 184f94b..d4b1e89 100644
+--- a/tests/services/test_checkout.py
++++ b/tests/services/test_checkout.py
+@@ -1,3 +1,5 @@
++from datetime import date
++
+ import pytest
+ 
+ from shop.domain.errors import NotFound, PaymentDeclined, ValidationFailed
+@@ -95,3 +97,47 @@ def test_someone_elses_cart(services, make):
+     bob, _ = make.customer()
+     with pytest.raises(NotFound):
+         services.checkout.place_order(bob, make.cart(alice, ("TEE", 1)), "tok_visa")
++
++
++def test_discount_code(services, make):
++    make.product("TEE", price="20.00")
++    make.percent_off("SAVE10", percent=10)
++    customer, _ = make.customer()
++    cart_id = make.cart(customer, ("TEE", 1))
++
++    order = services.checkout.place_order(customer, cart_id, "tok_visa", discount_code="save10")
++
++    assert [(a.kind, a.amount) for a in order.adjustments] == [("discount_code", Money(200))]
++    assert order.tax == Money(300)
++    assert order.total == Money(1800 + 495)
++    assert order.loyalty_points_earned == 18
++
++
++def test_discount_code_comes_off_after_employee_discount_and_before_points(services, make):
++    make.product("HOODIE", price="55.00")
++    make.percent_off("HALF", percent=50)
++    customer, _ = make.customer(loyalty=1000, employee_discount=50)
++    cart_id = make.cart(customer, ("HOODIE", 1))
++
++    order = services.checkout.place_order(
++        customer, cart_id, "tok_visa", redeem_points=1000, discount_code="HALF"
++    )
++
++    assert [(a.kind, a.amount) for a in order.adjustments] == [
++        ("employee", Money(2750)),
++        ("discount_code", Money(1375)),
++        ("loyalty", Money(1000)),
++    ]
++    assert order.total == Money(375)
++    assert order.shipping == Money(0)
++
++
++def test_bad_discount_code_changes_nothing(services, make, gateway):
++    make.product("TEE")
++    make.percent_off("OLD", expires_on=date(2026, 1, 1))
++    customer, _ = make.customer()
++    cart_id = make.cart(customer, ("TEE", 1))
++    with pytest.raises(ValidationFailed, match="expired"):
++        services.checkout.place_order(customer, cart_id, "tok_visa", discount_code="OLD")
++    assert gateway.charges == {}
++    assert services.carts.get(customer, cart_id).lines
+diff --git a/tests/services/test_discount_codes.py b/tests/services/test_discount_codes.py
+new file mode 100644
+index 0000000..38f7cb5
+--- /dev/null
++++ b/tests/services/test_discount_codes.py
+@@ -0,0 +1,58 @@
++from datetime import UTC, date, datetime
++
++import pytest
++
++from shop import clock
++from shop.domain.discount_codes import PercentOff
++from shop.domain.errors import Conflict, ValidationFailed
++
++
++def test_create(services, make):
++    staff, _ = make.staff()
++    created = services.discount_codes.create(staff, PercentOff("summer-20", date(2026, 8, 31), 20))
++    assert created == PercentOff("SUMMER-20", date(2026, 8, 31), 20)
++    assert services.discount_codes.list() == [created]
++    [entry] = services.audit.entries("discount_code:SUMMER-20")
++    assert entry.action == "discount_code.created"
++    assert entry.details == {"kind": "percent_off", "expires_on": "2026-08-31", "percent": 20}
++
++
++def test_create_duplicate(services, make):
++    staff, _ = make.staff()
++    make.percent_off("SAVE10")
++    with pytest.raises(Conflict):
++        services.discount_codes.create(staff, PercentOff("save10", None, 15))
++
++
++def test_create_invalid_changes_nothing(services, make):
++    staff, _ = make.staff()
++    with pytest.raises(ValidationFailed):
++        services.discount_codes.create(staff, PercentOff("SAVE10", None, 0))
++    assert services.discount_codes.list() == []
++    assert services.audit.entries() == []
++
++
++def test_for_checkout_ignores_case(services, make):
++    code = make.percent_off("SAVE10")
++    assert services.discount_codes.for_checkout(" save10") == code
++
++
++def test_for_checkout_unknown(services):
++    with pytest.raises(ValidationFailed, match="isn't a discount code"):
++        services.discount_codes.for_checkout("NOPE")
++
++
++def test_for_checkout_expired(services, make):
++    make.percent_off("SAVE10", expires_on=date(2026, 6, 14))
++    with pytest.raises(ValidationFailed, match="expired"):
++        services.discount_codes.for_checkout("SAVE10")
++
++
++def test_expiry_is_in_uk_time(services, make, monkeypatch):
++    make.percent_off("SAVE10", expires_on=date(2026, 6, 15))
++    # 23:30 UTC on the 15th is 00:30 BST on the 16th.
++    monkeypatch.setattr(clock, "now", lambda: datetime(2026, 6, 15, 22, 59, tzinfo=UTC))
++    services.discount_codes.for_checkout("SAVE10")
++    monkeypatch.setattr(clock, "now", lambda: datetime(2026, 6, 15, 23, 30, tzinfo=UTC))
++    with pytest.raises(ValidationFailed, match="expired"):
++        services.discount_codes.for_checkout("SAVE10")
+-- 
+2.54.0 (Apple Git-157)
+
