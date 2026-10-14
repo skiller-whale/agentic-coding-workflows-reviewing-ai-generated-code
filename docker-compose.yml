@@ -8,7 +8,7 @@ services:
       WATCHER_BASE_PATH: "/app"
       ATTENDANCE_ID_FILE: "/app/sync/attendance_id"
       WATCHED_EXTS: ".py .yaml .json .md .chat"
-      IGNORE_MATCH: ".git .pytest_cache .ruff_cache"
+      IGNORE_MATCH: ".git .pytest_cache .ruff_cache .venv"
     volumes:
       - .:/app/code
       - ./.chat_history:/app/chat_history
