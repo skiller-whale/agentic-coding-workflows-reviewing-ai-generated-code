@@ -9,12 +9,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  shop/db/migrations/008_discount_codes.sql |  8 +++++
  shop/repositories/discount_codes.py       | 36 +++++++++++++++++++++++
- tests/db/test_discount_codes.py           | 25 ++++++++++++++++
  tests/factories.py                        | 14 ++++++++-
- 4 files changed, 82 insertions(+), 1 deletion(-)
+ tests/repositories/__init__.py            |  0
+ tests/repositories/test_discount_codes.py | 25 ++++++++++++++++
+ 5 files changed, 82 insertions(+), 1 deletion(-)
  create mode 100644 shop/db/migrations/008_discount_codes.sql
  create mode 100644 shop/repositories/discount_codes.py
- create mode 100644 tests/db/test_discount_codes.py
+ create mode 100644 tests/repositories/__init__.py
+ create mode 100644 tests/repositories/test_discount_codes.py
 
 diff --git a/shop/db/migrations/008_discount_codes.sql b/shop/db/migrations/008_discount_codes.sql
 new file mode 100644
@@ -72,37 +74,6 @@ index 0000000..00f4b57
 +                to_db_time(code.created_at),
 +            ),
 +        )
-diff --git a/tests/db/test_discount_codes.py b/tests/db/test_discount_codes.py
-new file mode 100644
-index 0000000..c10b614
---- /dev/null
-+++ b/tests/db/test_discount_codes.py
-@@ -0,0 +1,25 @@
-+from datetime import date
-+
-+import pytest
-+
-+from shop.domain.errors import Conflict, NotFound
-+from shop.repositories.discount_codes import DiscountCodeRepository
-+
-+
-+def test_discount_codes_round_trip(conn, make):
-+    with_expiry = make.discount_code("SUMMER10", percent=10, expires_on=date(2026, 8, 31))
-+    without = make.discount_code("FOREVER5", percent=5)
-+    repo = DiscountCodeRepository(conn)
-+    assert repo.get("SUMMER10") == with_expiry
-+    assert repo.get("FOREVER5") == without
-+
-+
-+def test_duplicate_discount_code(make):
-+    make.discount_code("SUMMER10")
-+    with pytest.raises(Conflict):
-+        make.discount_code("SUMMER10")
-+
-+
-+def test_unknown_discount_code(conn):
-+    with pytest.raises(NotFound):
-+        DiscountCodeRepository(conn).get("NOPE")
 diff --git a/tests/factories.py b/tests/factories.py
 index e1c3184..6de870b 100644
 --- a/tests/factories.py
@@ -137,6 +108,40 @@ index e1c3184..6de870b 100644
 +        )
 +        DiscountCodeRepository(self.conn).add(discount_code)
 +        return discount_code
+diff --git a/tests/repositories/__init__.py b/tests/repositories/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/repositories/test_discount_codes.py b/tests/repositories/test_discount_codes.py
+new file mode 100644
+index 0000000..c10b614
+--- /dev/null
++++ b/tests/repositories/test_discount_codes.py
+@@ -0,0 +1,25 @@
++from datetime import date
++
++import pytest
++
++from shop.domain.errors import Conflict, NotFound
++from shop.repositories.discount_codes import DiscountCodeRepository
++
++
++def test_discount_codes_round_trip(conn, make):
++    with_expiry = make.discount_code("SUMMER10", percent=10, expires_on=date(2026, 8, 31))
++    without = make.discount_code("FOREVER5", percent=5)
++    repo = DiscountCodeRepository(conn)
++    assert repo.get("SUMMER10") == with_expiry
++    assert repo.get("FOREVER5") == without
++
++
++def test_duplicate_discount_code(make):
++    make.discount_code("SUMMER10")
++    with pytest.raises(Conflict):
++        make.discount_code("SUMMER10")
++
++
++def test_unknown_discount_code(conn):
++    with pytest.raises(NotFound):
++        DiscountCodeRepository(conn).get("NOPE")
 -- 
 2.54.0 (Apple Git-157)
 

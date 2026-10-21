@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 23:18:24 +0200
+Subject: [PATCH 5/8] feat: turn a discount code into an adjustment, rejecting
+ expired codes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ shop/domain/discount_codes.py       | 17 ++++++++++-
+ tests/domain/test_discount_codes.py | 44 +++++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+), 1 deletion(-)
+ create mode 100644 tests/domain/test_discount_codes.py
+
+diff --git a/shop/domain/discount_codes.py b/shop/domain/discount_codes.py
+index 3a3a9c2..f448378 100644
+--- a/shop/domain/discount_codes.py
++++ b/shop/domain/discount_codes.py
+@@ -2,7 +2,8 @@ import re
+ from datetime import date
+ 
+ from shop.domain.errors import ValidationFailed
+-from shop.domain.models import DiscountCode
++from shop.domain.models import Adjustment, DiscountCode
++from shop.domain.money import Money
+ 
+ CODE_PATTERN = re.compile(r"^[A-Z0-9-]{3,20}$")
+ 
+@@ -19,3 +20,17 @@ def check_new(discount: DiscountCode, today: date) -> None:
+         raise ValidationFailed("Discount codes must be for between 1 and 100%")
+     if discount.expires_on is not None and discount.expires_on < today:
+         raise ValidationFailed("That expiry date has already passed")
++
++
++def adjustment(discount: DiscountCode, merchandise: Money, today: date) -> Adjustment | None:
++    """The adjustment for using `discount` on an order, or None if it comes to nothing."""
++    if discount.expires_on is not None and discount.expires_on < today:
++        raise ValidationFailed(f"The discount code {discount.code} has expired")
++    amount = merchandise.percent(discount.percent)
++    if amount.is_zero():
++        return None
++    return Adjustment(
++        kind="discount_code",
++        description=f"{discount.code}: {discount.percent}% off",
++        amount=amount,
++    )
+diff --git a/tests/domain/test_discount_codes.py b/tests/domain/test_discount_codes.py
+new file mode 100644
+index 0000000..8d990ba
+--- /dev/null
++++ b/tests/domain/test_discount_codes.py
+@@ -0,0 +1,44 @@
++from datetime import UTC, date, datetime
++
++import pytest
++
++from shop.domain.discount_codes import adjustment
++from shop.domain.errors import ValidationFailed
++from shop.domain.models import DiscountCode, DiscountKind
++from shop.domain.money import Money
++
++TODAY = date(2026, 6, 15)
++
++
++def percent_code(percent: int = 20, expires_on: date | None = None) -> DiscountCode:
++    return DiscountCode(
++        code="SUMMER20",
++        kind=DiscountKind.PERCENT,
++        created_at=datetime(2026, 6, 1, tzinfo=UTC),
++        percent=percent,
++        expires_on=expires_on,
++    )
++
++
++def test_percent_off_merchandise():
++    result = adjustment(percent_code(20), Money(5500), TODAY)
++    assert result.kind == "discount_code"
++    assert result.description == "SUMMER20: 20% off"
++    assert result.amount == Money(1100)
++
++
++def test_rounds_to_the_nearest_penny():
++    assert adjustment(percent_code(15), Money(1999), TODAY).amount == Money(300)
++
++
++def test_nothing_off_nothing():
++    assert adjustment(percent_code(1), Money(49), TODAY) is None
++
++
++def test_usable_on_its_expiry_date():
++    assert adjustment(percent_code(expires_on=TODAY), Money(2000), TODAY) is not None
++
++
++def test_expired():
++    with pytest.raises(ValidationFailed, match="expired"):
++        adjustment(percent_code(expires_on=date(2026, 6, 14)), Money(2000), TODAY)
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,48 +1,15 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
-Date: Tue, 13 Oct 2026 11:27:07 +0200
-Subject: [PATCH 1/7] chore: encode review findings in the harness
+Date: Mon, 19 Oct 2026 23:15:36 +0200
+Subject: [PATCH 1/8] chore: encode review findings in the harness
 
 ---
- .claude/agents/maintainer-review.md | 12 +++-
- .claude/settings.json               | 21 +++++++
- CLAUDE.md                           | 15 +++++
- scripts/conventions.py              | 92 +++++++++++++++++++++++++++++
- 4 files changed, 138 insertions(+), 2 deletions(-)
+ .claude/settings.json  | 21 ++++++++++
+ CLAUDE.md              | 15 +++++++
+ scripts/conventions.py | 92 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 128 insertions(+)
  create mode 100644 scripts/conventions.py
 
-diff --git a/.claude/agents/maintainer-review.md b/.claude/agents/maintainer-review.md
-index c1dface..d13a91b 100644
---- a/.claude/agents/maintainer-review.md
-+++ b/.claude/agents/maintainer-review.md
-@@ -1,6 +1,6 @@
- ---
- name: maintainer-review
--description: Reviews a change the way this codebase's maintainers would. Only use when the user explicitly asks for a maintainer review.
-+description: Reviews a finished change the way this codebase's maintainers would, before it's handed over. Use after completing any feature or significant change.
- tools: Read, Grep, Glob, Bash
- ---
- 
-@@ -8,10 +8,18 @@ You are a maintainer of this codebase, reviewing a colleague's change before it'
- Run `git diff main...HEAD` to see the committed change, and `git status` and `git diff HEAD` for any work not yet committed.
- Don't edit anything: report findings only.
- 
-+Read the plan for the change, in `.plans/`.
-+It starts with the request, quoted exactly: that's what the change is for.
-+The rest of the plan, and the summary at its end, are the author's account of its own work: claims to check, not facts.
-+
- Judge whether the change belongs in this codebase, not just whether it works.
- Before judging the new code, read the existing code it sits next to, and compare:
- 
--- **Conventions**: does the change follow how the codebase already does things (layering, errors, money, staff actions and the audit log, migrations, adjustments, docs and changelog, tests and factories)?
-+- **Intent**: does the change do what the request asked for, and no more?
-+  Check each decision the plan lists: did the request settle it, and if not, is it the choice the request's author would most likely expect?
-+  Does the code do what the plan says?
-+  And look for decisions the code makes that the plan doesn't list.
-+- **Conventions** in CLAUDE.md: layering, errors, money, staff actions and the audit log, migrations, adjustments, docs and changelog, tests and factories. Check each one.
- - **One way of doing things**: does the change add a second mechanism for something the codebase already does?
- - **Scope**: does it change anything the task didn't need, including how existing features behave?
- - **Over-engineering**: abstractions, registries or configuration for needs nobody has confirmed.
 diff --git a/.claude/settings.json b/.claude/settings.json
 index 8afbc1e..827f834 100644
 --- a/.claude/settings.json

@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 23:16:33 +0200
+Subject: [PATCH 2/8] docs: plan discount codes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .plans/discount-codes-3.md | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+ create mode 100644 .plans/discount-codes-3.md
+
+diff --git a/.plans/discount-codes-3.md b/.plans/discount-codes-3.md
+new file mode 100644
+index 0000000..c382df4
+--- /dev/null
++++ b/.plans/discount-codes-3.md
+@@ -0,0 +1,32 @@
++# Discount codes
++
++## Request
++
++> Marketing want to run promotions with discount codes.
++> Start with percentage-off codes: staff create them, with an optional expiry date, and customers can enter one at checkout.
++> We'll probably want other kinds of promotion later (a fixed amount off, free shipping, buy one get one free), so bear that in mind.
++
++## Commits
++
++1. `feat`: staff can create percentage-off discount codes (service, with an audit entry).
++   - New migration `008_discount_codes.sql`: a `discount_codes` table keyed by `code`, with a `kind` column (`percent` for now) and a nullable `percent`, so other kinds can add their own columns in later migrations without reshaping this one.
++   - `DiscountCode` in `shop/domain/models.py` has a `kind` too. I'm not building a class hierarchy or registry for kinds we don't have yet.
++   - Codes are case-insensitive: stored and looked up upper-case, 3 to 20 of `A-Z`, `0-9` and `-`. A duplicate is a `Conflict`.
++   - The percentage must be 1 to 100.
++   - Expiry is a date (`expires_on`), not a time: the code works up to the end of that day in UK time (`clock.SHOP_TIMEZONE`). An expiry date already in the past is rejected.
++   - Audited as `discount_code.created`, subject `discount_code:<CODE>`.
++2. `feat`: `POST /admin/discount-codes` lets staff create a code over the API.
++   - Body `{"code", "percent", "expires_on"}` (`expires_on` optional, `YYYY-MM-DD`). Returns 201 with the code.
++   - Only create, no list/update/delete: not asked for yet.
++3. `feat`: a discount code becomes an `Adjustment` of kind `discount_code`, and expired codes are rejected (domain only).
++   - The percentage is of the merchandise before other adjustments, like the employee discount, so the order they're applied in doesn't matter.
++   - Description like `"SUMMER20: 20% off"`, so the order records which code was used without adding a field to orders.
++4. `feat`: customers can enter a discount code when placing an order (service).
++   - One code per order.
++   - Codes stack with the employee discount and loyalty points. If together they come to more than the merchandise, `price` already rejects the order.
++   - An unknown or expired code is a `ValidationFailed` (422), not a 404: it's a bad value in the request, not a missing resource.
++   - No usage limits (per customer or overall): not asked for.
++5. `feat`: `POST /checkout` accepts an optional `discount_code`.
++   - The cart preview doesn't take a code yet.
++
++Later promotions, for reference (not built): a fixed amount off fits as another `kind` that makes an `Adjustment`. Free shipping doesn't fit `Adjustment` (which comes off merchandise, before tax), so it will need a change to `pricing.price`. Buy one get one free needs the order lines, so the code-to-adjustment function will take the lines rather than just the merchandise total when that comes.
+-- 
+2.54.0 (Apple Git-157)
+

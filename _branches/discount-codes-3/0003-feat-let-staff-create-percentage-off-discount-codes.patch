@@ -1,0 +1,298 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 23:17:29 +0200
+Subject: [PATCH 3/8] feat: let staff create percentage-off discount codes
+
+Adds the discount_codes table (migration 008), DiscountCode, and
+DiscountCodeService.create_percent_code, which validates the code and
+records discount_code.created in the audit log. Not exposed over the API
+yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ shop/clock.py                             |  7 ++-
+ shop/db/migrations/008_discount_codes.sql |  8 ++++
+ shop/domain/discount_codes.py             | 21 ++++++++
+ shop/domain/models.py                     | 17 ++++++-
+ shop/repositories/discount_codes.py       | 22 +++++++++
+ shop/services/__init__.py                 |  4 ++
+ shop/services/discount_codes.py           | 39 +++++++++++++++
+ tests/services/test_discount_codes.py     | 58 +++++++++++++++++++++++
+ 8 files changed, 174 insertions(+), 2 deletions(-)
+ create mode 100644 shop/db/migrations/008_discount_codes.sql
+ create mode 100644 shop/domain/discount_codes.py
+ create mode 100644 shop/repositories/discount_codes.py
+ create mode 100644 shop/services/discount_codes.py
+ create mode 100644 tests/services/test_discount_codes.py
+
+diff --git a/shop/clock.py b/shop/clock.py
+index 857b271..b0ecd1f 100644
+--- a/shop/clock.py
++++ b/shop/clock.py
+@@ -1,4 +1,4 @@
+-from datetime import UTC, datetime
++from datetime import UTC, date, datetime
+ from zoneinfo import ZoneInfo
+ 
+ SHOP_TIMEZONE = ZoneInfo("Europe/London")
+@@ -7,3 +7,8 @@ SHOP_TIMEZONE = ZoneInfo("Europe/London")
+ def now() -> datetime:
+     """The current time, in UTC. Tests freeze this."""
+     return datetime.now(UTC)
++
++
++def today() -> date:
++    """Today's date in the UK. Dates the shop shows people, like expiry dates, are UK dates."""
++    return now().astimezone(SHOP_TIMEZONE).date()
+diff --git a/shop/db/migrations/008_discount_codes.sql b/shop/db/migrations/008_discount_codes.sql
+new file mode 100644
+index 0000000..83a0cc1
+--- /dev/null
++++ b/shop/db/migrations/008_discount_codes.sql
+@@ -0,0 +1,8 @@
++-- `kind` says how a code reduces the price. Each kind gets its own nullable columns.
++CREATE TABLE discount_codes (
++    code TEXT PRIMARY KEY,
++    kind TEXT NOT NULL,
++    percent INTEGER CHECK (percent BETWEEN 1 AND 100),
++    expires_on TEXT,
++    created_at TEXT NOT NULL
++);
+diff --git a/shop/domain/discount_codes.py b/shop/domain/discount_codes.py
+new file mode 100644
+index 0000000..3a3a9c2
+--- /dev/null
++++ b/shop/domain/discount_codes.py
+@@ -0,0 +1,21 @@
++import re
++from datetime import date
++
++from shop.domain.errors import ValidationFailed
++from shop.domain.models import DiscountCode
++
++CODE_PATTERN = re.compile(r"^[A-Z0-9-]{3,20}$")
++
++
++def normalise(code: str) -> str:
++    """Codes are case-insensitive, so customers can type them however they like."""
++    return code.strip().upper()
++
++
++def check_new(discount: DiscountCode, today: date) -> None:
++    if not CODE_PATTERN.match(discount.code):
++        raise ValidationFailed("Codes must be 3 to 20 letters, digits or hyphens")
++    if discount.percent is None or not 1 <= discount.percent <= 100:
++        raise ValidationFailed("Discount codes must be for between 1 and 100%")
++    if discount.expires_on is not None and discount.expires_on < today:
++        raise ValidationFailed("That expiry date has already passed")
+diff --git a/shop/domain/models.py b/shop/domain/models.py
+index 4fa24b3..f1e7668 100644
+--- a/shop/domain/models.py
++++ b/shop/domain/models.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+-from datetime import datetime
++from datetime import date, datetime
+ from enum import StrEnum
+ 
+ from shop.domain.money import Money
+@@ -95,6 +95,21 @@ class Order:
+     dispatched_at: datetime | None = None
+ 
+ 
++class DiscountKind(StrEnum):
++    PERCENT = "percent"
++
++
++@dataclass(frozen=True)
++class DiscountCode:
++    code: str
++    kind: DiscountKind
++    created_at: datetime
++    # For PERCENT codes. Other kinds will bring their own fields.
++    percent: int | None = None
++    # The last day the code can be used, in the UK.
++    expires_on: date | None = None
++
++
+ @dataclass(frozen=True)
+ class AuditEntry:
+     id: int
+diff --git a/shop/repositories/discount_codes.py b/shop/repositories/discount_codes.py
+new file mode 100644
+index 0000000..017e548
+--- /dev/null
++++ b/shop/repositories/discount_codes.py
+@@ -0,0 +1,22 @@
++from shop.domain.errors import Conflict
++from shop.domain.models import DiscountCode
++from shop.repositories.base import Repository, to_db_time
++
++
++class DiscountCodeRepository(Repository):
++    def add(self, discount: DiscountCode) -> None:
++        if self.conn.execute(
++            "SELECT 1 FROM discount_codes WHERE code = ?", (discount.code,)
++        ).fetchone():
++            raise Conflict(f"There's already a discount code {discount.code!r}")
++        self.conn.execute(
++            "INSERT INTO discount_codes (code, kind, percent, expires_on, created_at)"
++            " VALUES (?, ?, ?, ?, ?)",
++            (
++                discount.code,
++                discount.kind.value,
++                discount.percent,
++                discount.expires_on.isoformat() if discount.expires_on else None,
++                to_db_time(discount.created_at),
++            ),
++        )
+diff --git a/shop/services/__init__.py b/shop/services/__init__.py
+index ed409f3..14b3043 100644
+--- a/shop/services/__init__.py
++++ b/shop/services/__init__.py
+@@ -6,6 +6,7 @@ from shop.payments.gateway import PaymentGateway
+ from shop.repositories.audit import AuditRepository
+ from shop.repositories.carts import CartRepository
+ from shop.repositories.customers import CustomerRepository, StaffRepository, TokenRepository
++from shop.repositories.discount_codes import DiscountCodeRepository
+ from shop.repositories.orders import OrderRepository
+ from shop.repositories.products import ProductRepository
+ from shop.services.audit import AuditLog
+@@ -13,6 +14,7 @@ from shop.services.carts import CartService
+ from shop.services.catalog import CatalogService
+ from shop.services.checkout import CheckoutService
+ from shop.services.customers import CustomerService
++from shop.services.discount_codes import DiscountCodeService
+ from shop.services.orders import OrderService
+ 
+ 
+@@ -26,6 +28,7 @@ class Services:
+     carts: CartService
+     checkout: CheckoutService
+     orders: OrderService
++    discount_codes: DiscountCodeService
+     audit: AuditLog
+     staff: StaffRepository
+     tokens: TokenRepository
+@@ -48,6 +51,7 @@ class Services:
+             carts=carts,
+             checkout=CheckoutService(carts, cart_repo, customers, orders, gateway, settings),
+             orders=OrderService(orders, customers, audit, gateway),
++            discount_codes=DiscountCodeService(DiscountCodeRepository(conn), audit),
+             audit=audit,
+             staff=StaffRepository(conn),
+             tokens=tokens,
+diff --git a/shop/services/discount_codes.py b/shop/services/discount_codes.py
+new file mode 100644
+index 0000000..a6ba8cb
+--- /dev/null
++++ b/shop/services/discount_codes.py
+@@ -0,0 +1,39 @@
++from datetime import date
++
++from shop import clock
++from shop.db.connection import transaction
++from shop.domain import discount_codes
++from shop.domain.models import DiscountCode, DiscountKind, StaffMember
++from shop.repositories.discount_codes import DiscountCodeRepository
++from shop.services.audit import AuditLog
++
++
++class DiscountCodeService:
++    def __init__(self, codes: DiscountCodeRepository, audit: AuditLog):
++        self.codes = codes
++        self.audit = audit
++
++    # --- staff ---
++
++    def create_percent_code(
++        self, staff: StaffMember, code: str, percent: int, expires_on: date | None = None
++    ) -> DiscountCode:
++        discount = DiscountCode(
++            code=discount_codes.normalise(code),
++            kind=DiscountKind.PERCENT,
++            created_at=clock.now(),
++            percent=percent,
++            expires_on=expires_on,
++        )
++        discount_codes.check_new(discount, clock.today())
++        with transaction(self.codes.conn):
++            self.codes.add(discount)
++            self.audit.record(
++                staff,
++                "discount_code.created",
++                f"discount_code:{discount.code}",
++                kind=discount.kind.value,
++                percent=percent,
++                expires_on=expires_on.isoformat() if expires_on else None,
++            )
++        return discount
+diff --git a/tests/services/test_discount_codes.py b/tests/services/test_discount_codes.py
+new file mode 100644
+index 0000000..9e039cc
+--- /dev/null
++++ b/tests/services/test_discount_codes.py
+@@ -0,0 +1,58 @@
++from datetime import date
++
++import pytest
++
++from shop.domain.errors import Conflict, ValidationFailed
++from shop.domain.models import DiscountKind
++
++
++def test_create_percent_code_is_audited(services, make):
++    staff, _ = make.staff()
++    discount = services.discount_codes.create_percent_code(
++        staff, "summer20", 20, expires_on=date(2026, 8, 31)
++    )
++    assert (discount.code, discount.kind, discount.percent) == (
++        "SUMMER20",
++        DiscountKind.PERCENT,
++        20,
++    )
++    [entry] = services.audit.entries(subject="discount_code:SUMMER20")
++    assert entry.action == "discount_code.created"
++    assert entry.details == {"kind": "percent", "percent": 20, "expires_on": "2026-08-31"}
++
++
++def test_expiry_is_optional(services, make):
++    staff, _ = make.staff()
++    discount = services.discount_codes.create_percent_code(staff, "FOREVER", 10)
++    assert discount.expires_on is None
++
++
++def test_codes_are_unique_ignoring_case(services, make):
++    staff, _ = make.staff()
++    services.discount_codes.create_percent_code(staff, "SUMMER20", 20)
++    with pytest.raises(Conflict):
++        services.discount_codes.create_percent_code(staff, "Summer20", 10)
++
++
++@pytest.mark.parametrize("percent", [0, 101])
++def test_percent_limits(services, make, percent):
++    staff, _ = make.staff()
++    with pytest.raises(ValidationFailed):
++        services.discount_codes.create_percent_code(staff, "SUMMER20", percent)
++
++
++@pytest.mark.parametrize("code", ["AB", "SUMMER 20", "X" * 21, "SALE!"])
++def test_code_format(services, make, code):
++    staff, _ = make.staff()
++    with pytest.raises(ValidationFailed):
++        services.discount_codes.create_percent_code(staff, code, 20)
++
++
++def test_expiry_cant_be_in_the_past(services, make, frozen_clock):
++    staff, _ = make.staff()
++    with pytest.raises(ValidationFailed):
++        services.discount_codes.create_percent_code(staff, "LATE", 20, expires_on=date(2026, 6, 14))
++    today = services.discount_codes.create_percent_code(
++        staff, "TODAY", 20, expires_on=frozen_clock.date()
++    )
++    assert today.expires_on == date(2026, 6, 15)
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 23:19:30 +0200
+Subject: [PATCH 8/8] docs: summarise discount codes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .plans/discount-codes-3.md | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/.plans/discount-codes-3.md b/.plans/discount-codes-3.md
+index c382df4..0720260 100644
+--- a/.plans/discount-codes-3.md
++++ b/.plans/discount-codes-3.md
+@@ -30,3 +30,17 @@
+    - The cart preview doesn't take a code yet.
+ 
+ Later promotions, for reference (not built): a fixed amount off fits as another `kind` that makes an `Adjustment`. Free shipping doesn't fit `Adjustment` (which comes off merchandise, before tax), so it will need a change to `pricing.price`. Buy one get one free needs the order lines, so the code-to-adjustment function will take the lines rather than just the merchandise total when that comes.
++
++## Summary
++
++Staff can create percentage-off discount codes with `POST /admin/discount-codes` (`code`, `percent`, optional `expires_on`). Each one is recorded in the audit log. Customers can pass `discount_code` to `POST /checkout`, and the discount shows on the order as an `Adjustment` of kind `discount_code` (e.g. `"SUMMER20: 20% off"`). Commits went as planned. The only addition is `clock.today()`, the current UK date, used for expiry.
++
++Decisions to check:
++
++- **Expiry is a date, not a time.** A code works until midnight UK time at the end of `expires_on`. Expiry dates in the past are rejected when the code is created.
++- **Percent is 1 to 100.** Employee discounts are capped at 50, but nothing in the request suggested a cap here.
++- **Stacking.** Codes combine with the employee discount and loyalty points. Each percentage is of the full merchandise, not what's left after other reductions. If the reductions add up to more than the merchandise, checkout fails with a 422 (the existing rule in `price`). For example, a staff member on 50% off using a 60% code can't check out. If that's wrong, we could stop codes stacking with employee discounts, or cap the total.
++- **Unknown or expired codes are 422s.** A 404 would suggest the endpoint is missing, when the problem is a bad value in the request. In both cases the order isn't placed and the customer isn't charged.
++- **Codes are case-insensitive.** They're stored in upper case: 3 to 20 letters, digits or hyphens.
++- **Not built:** listing, editing or ending codes early; usage limits (per customer or in total); minimum spend; a code in the cart preview. None of these were asked for.
++- **Other kinds of promotion.** `discount_codes` has a `kind` column, and `DiscountCode` has a `kind`, so a fixed amount off can be added as a new kind with its own column in a new migration. Free shipping doesn't fit `Adjustment` (which comes off merchandise before tax), so it will need a change to `pricing.price`. Buy one get one free needs the order lines, so `discount_codes.adjustment` will take the lines instead of the merchandise total when it's added.
+-- 
+2.54.0 (Apple Git-157)
+
