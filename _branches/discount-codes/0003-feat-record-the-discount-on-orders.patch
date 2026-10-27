@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:09:23 +0000
+Subject: [PATCH 3/5] feat: record the discount on orders
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ migrations/004_order_discounts.sql |  2 ++
+ shop/db.py                         | 23 +++++++++++++++++----
+ shop/pricing.py                    |  1 +
+ shop/schemas.py                    |  2 ++
+ tests/test_api.py                  |  3 +++
+ tests/test_db.py                   | 32 ++++++++++++++++++++++++++++++
+ 6 files changed, 59 insertions(+), 4 deletions(-)
+ create mode 100644 migrations/004_order_discounts.sql
+ create mode 100644 tests/test_db.py
+
+diff --git a/migrations/004_order_discounts.sql b/migrations/004_order_discounts.sql
+new file mode 100644
+index 0000000..f3822ca
+--- /dev/null
++++ b/migrations/004_order_discounts.sql
+@@ -0,0 +1,2 @@
++ALTER TABLE orders ADD COLUMN discount_pence INTEGER NOT NULL DEFAULT 0;
++ALTER TABLE orders ADD COLUMN discount_code TEXT REFERENCES discount_codes (code);
+diff --git a/shop/db.py b/shop/db.py
+index 005aa4f..659d9ab 100644
+--- a/shop/db.py
++++ b/shop/db.py
+@@ -29,6 +29,7 @@ class Order:
+     id: int
+     lines: list[Line]
+     price: Price
++    discount_code: str | None = None
+ 
+ 
+ def connect(path: str) -> sqlite3.Connection:
+@@ -90,11 +91,24 @@ def add_discount_code(conn: sqlite3.Connection, discount_code: DiscountCode) ->
+         )
+ 
+ 
+-def add_order(conn: sqlite3.Connection, lines: list[Line], price: Price) -> int:
++def add_order(
++    conn: sqlite3.Connection,
++    lines: list[Line],
++    price: Price,
++    discount_code: str | None = None,
++) -> int:
+     with conn:
+         order_id = conn.execute(
+-            "INSERT INTO orders (subtotal_pence, shipping_pence, total_pence) VALUES (?, ?, ?)",
+-            (price.subtotal.pence, price.shipping.pence, price.total.pence),
++            "INSERT INTO orders"
++            " (subtotal_pence, discount_pence, discount_code, shipping_pence, total_pence)"
++            " VALUES (?, ?, ?, ?, ?)",
++            (
++                price.subtotal.pence,
++                price.discount.pence,
++                discount_code,
++                price.shipping.pence,
++                price.total.pence,
++            ),
+         ).lastrowid
+         conn.executemany(
+             "INSERT INTO order_lines (order_id, sku, price_pence, quantity) VALUES (?, ?, ?, ?)",
+@@ -116,5 +130,6 @@ def get_order(conn: sqlite3.Connection, order_id: int) -> Order | None:
+         subtotal=Money(row["subtotal_pence"]),
+         shipping=Money(row["shipping_pence"]),
+         total=Money(row["total_pence"]),
++        discount=Money(row["discount_pence"]),
+     )
+-    return Order(row["id"], lines, price)
++    return Order(row["id"], lines, price, row["discount_code"])
+diff --git a/shop/pricing.py b/shop/pricing.py
+index 9d2e77f..6e13c2e 100644
+--- a/shop/pricing.py
++++ b/shop/pricing.py
+@@ -18,6 +18,7 @@ class Price:
+     subtotal: Money
+     shipping: Money
+     total: Money
++    discount: Money = Money(0)
+ 
+ 
+ def price(lines: list[Line]) -> Price:
+diff --git a/shop/schemas.py b/shop/schemas.py
+index dfa72e6..9b9842d 100644
+--- a/shop/schemas.py
++++ b/shop/schemas.py
+@@ -35,6 +35,7 @@ def discount_code_json(discount_code: DiscountCode) -> dict:
+ def price_json(order_price: Price) -> dict:
+     return {
+         "subtotal": str(order_price.subtotal),
++        "discount": str(order_price.discount),
+         "shipping": str(order_price.shipping),
+         "total": str(order_price.total),
+     }
+@@ -48,4 +49,5 @@ def order_json(order: Order) -> dict:
+             for line in order.lines
+         ],
+         **price_json(order.price),
++        "discount_code": order.discount_code,
+     }
+diff --git a/tests/test_api.py b/tests/test_api.py
+index df8f953..c44abff 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -77,6 +77,7 @@ def test_checkout(client, add_product):
+     assert response.json() == {
+         "order_id": 1,
+         "subtotal": "31.00",
++        "discount": "0.00",
+         "shipping": "4.95",
+         "total": "35.95",
+     }
+@@ -109,8 +110,10 @@ def test_checkout_stores_the_order(client, staff_headers, add_product):
+         "id": order_id,
+         "items": [{"sku": "TEE", "price": "15.00", "quantity": 2}],
+         "subtotal": "30.00",
++        "discount": "0.00",
+         "shipping": "4.95",
+         "total": "34.95",
++        "discount_code": None,
+     }
+ 
+ 
+diff --git a/tests/test_db.py b/tests/test_db.py
+new file mode 100644
+index 0000000..7c68c20
+--- /dev/null
++++ b/tests/test_db.py
+@@ -0,0 +1,32 @@
++from shop import db
++from shop.money import Money
++from shop.pricing import Line, Price
++
++
++def test_add_order_with_a_discount():
++    conn = db.connect(":memory:")
++    db.add_product(conn, db.Product("TEE", "T-shirt", Money(1500)))
++    db.add_discount_code(conn, db.DiscountCode("SAVE10", 10))
++    lines = [Line("TEE", Money(1500), 2)]
++    price = Price(
++        subtotal=Money(3000), shipping=Money(495), total=Money(3195), discount=Money(300)
++    )
++
++    order_id = db.add_order(conn, lines, price, discount_code="SAVE10")
++
++    order = db.get_order(conn, order_id)
++    assert order.price == price
++    assert order.discount_code == "SAVE10"
++
++
++def test_add_order_without_a_discount():
++    conn = db.connect(":memory:")
++    db.add_product(conn, db.Product("TEE", "T-shirt", Money(1500)))
++    lines = [Line("TEE", Money(1500), 2)]
++    price = Price(subtotal=Money(3000), shipping=Money(495), total=Money(3495))
++
++    order_id = db.add_order(conn, lines, price)
++
++    order = db.get_order(conn, order_id)
++    assert order.price.discount == Money(0)
++    assert order.discount_code is None
+-- 
+2.54.0 (Apple Git-157)
+

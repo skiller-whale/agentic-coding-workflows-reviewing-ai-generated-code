@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:02:11 +0000
+Subject: [PATCH 1/5] docs: plan discount codes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .plans/discount-codes.md | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+ create mode 100644 .plans/discount-codes.md
+
+diff --git a/.plans/discount-codes.md b/.plans/discount-codes.md
+new file mode 100644
+index 0000000..ffd00f2
+--- /dev/null
++++ b/.plans/discount-codes.md
+@@ -0,0 +1,11 @@
++# Discount codes
++
++> Add discount codes: staff can create a code for a percentage off the items, and customers can enter one at checkout.
++
++## Commits
++
++1. `docs: plan discount codes` - this plan.
++2. `feat: let staff create discount codes` - a `discount_codes` table, and a staff-only `POST /admin/discount-codes` route.
++3. `feat: record the discount on orders` - orders store their discount and the code used, and `GET /admin/orders/{id}` shows them.
++4. `feat: apply a discount code at checkout` - `POST /checkout` takes an optional `discount_code`, and takes its percentage off the items.
++5. `docs: document discount codes` - update `docs/api.md`, and summarise the change in this plan.
+-- 
+2.54.0 (Apple Git-157)
+

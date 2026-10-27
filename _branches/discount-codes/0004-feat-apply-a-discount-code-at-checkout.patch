@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:14:02 +0000
+Subject: [PATCH 4/5] feat: apply a discount code at checkout
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ shop/app.py           | 10 ++++++++--
+ shop/pricing.py       | 17 ++++++++++++++---
+ shop/schemas.py       |  1 +
+ tests/conftest.py     | 13 +++++++++++++
+ tests/test_api.py     | 32 ++++++++++++++++++++++++++++++++
+ tests/test_pricing.py | 24 ++++++++++++++++++++++++
+ 6 files changed, 92 insertions(+), 5 deletions(-)
+
+diff --git a/shop/app.py b/shop/app.py
+index b77b687..22d061f 100644
+--- a/shop/app.py
++++ b/shop/app.py
+@@ -41,8 +41,14 @@ def checkout(body: Checkout, conn=Depends(get_db)):
+         if product is None:
+             raise HTTPException(422, f"Unknown product: {item.sku}")
+         lines.append(Line(product.sku, product.price, item.quantity))
+-    order_price = price(lines)
+-    order_id = db.add_order(conn, lines, order_price)
++    percent_off = 0
++    if body.discount_code is not None:
++        discount_code = db.get_discount_code(conn, body.discount_code)
++        if discount_code is None:
++            raise HTTPException(422, f"Unknown discount code: {body.discount_code}")
++        percent_off = discount_code.percent_off
++    order_price = price(lines, percent_off)
++    order_id = db.add_order(conn, lines, order_price, body.discount_code)
+     return {"order_id": order_id, **price_json(order_price)}
+ 
+ 
+diff --git a/shop/pricing.py b/shop/pricing.py
+index 6e13c2e..310fc77 100644
+--- a/shop/pricing.py
++++ b/shop/pricing.py
+@@ -21,7 +21,18 @@ class Price:
+     discount: Money = Money(0)
+ 
+ 
+-def price(lines: list[Line]) -> Price:
++def price(lines: list[Line], percent_off: int = 0) -> Price:
++    """Price an order, taking `percent_off` per cent off the items.
++
++    `percent_off` defaults to 0, so callers written before discount codes existed,
++    which only pass the lines, keep working unchanged.
++    """
+     subtotal = sum((line.price * line.quantity for line in lines), Money(0))
+-    shipping = Money(0) if subtotal >= FREE_SHIPPING_FROM else SHIPPING
+-    return Price(subtotal=subtotal, shipping=shipping, total=subtotal + shipping)
++    discount = Money((subtotal.pence * percent_off + 50) // 100)
++    items = subtotal - discount
++    # Free shipping used to be judged on the full subtotal, before discount codes
++    # existed. Now that a code can reduce what the customer pays for the items, it's
++    # judged on the discounted amount instead, so a £55 order with 20% off (£44) no
++    # longer qualifies.
++    shipping = Money(0) if items >= FREE_SHIPPING_FROM else SHIPPING
++    return Price(subtotal=subtotal, shipping=shipping, total=items + shipping, discount=discount)
+diff --git a/shop/schemas.py b/shop/schemas.py
+index 9b9842d..a0b4e8f 100644
+--- a/shop/schemas.py
++++ b/shop/schemas.py
+@@ -11,6 +11,7 @@ class Item(BaseModel):
+ 
+ class Checkout(BaseModel):
+     items: list[Item] = Field(min_length=1)
++    discount_code: str | None = None
+ 
+ 
+ class NewProduct(BaseModel):
+diff --git a/tests/conftest.py b/tests/conftest.py
+index f915857..5542c77 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -31,3 +31,16 @@ def add_product(client, staff_headers):
+         assert response.status_code == 201
+ 
+     return add
++
++
++@pytest.fixture
++def add_discount_code(client, staff_headers):
++    def add(code, percent_off):
++        response = client.post(
++            "/admin/discount-codes",
++            json={"code": code, "percent_off": percent_off},
++            headers=staff_headers,
++        )
++        assert response.status_code == 201
++
++    return add
+diff --git a/tests/test_api.py b/tests/test_api.py
+index c44abff..d9ef497 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -98,6 +98,38 @@ def test_checkout_with_an_unknown_product(client):
+     assert response.status_code == 422
+ 
+ 
++def test_checkout_with_a_discount_code(client, staff_headers, add_product, add_discount_code):
++    add_product("TEE", "15.00")
++    add_discount_code("SAVE10", 10)
++
++    response = client.post(
++        "/checkout",
++        json={"items": [{"sku": "TEE", "quantity": 2}], "discount_code": "SAVE10"},
++    )
++
++    assert response.status_code == 201
++    assert response.json() == {
++        "order_id": 1,
++        "subtotal": "30.00",
++        "discount": "3.00",
++        "shipping": "4.95",
++        "total": "31.95",
++    }
++    order = client.get("/admin/orders/1", headers=staff_headers).json()
++    assert order["discount_code"] == "SAVE10"
++
++
++def test_checkout_with_an_unknown_discount_code(client, add_product):
++    add_product("TEE", "15.00")
++
++    response = client.post(
++        "/checkout",
++        json={"items": [{"sku": "TEE", "quantity": 1}], "discount_code": "NOPE"},
++    )
++
++    assert response.status_code == 422
++
++
+ def test_checkout_stores_the_order(client, staff_headers, add_product):
+     add_product("TEE", "15.00")
+     order_id = client.post(
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+index decc0ae..f36bb27 100644
+--- a/tests/test_pricing.py
++++ b/tests/test_pricing.py
+@@ -17,3 +17,27 @@ def test_shipping_is_free_from_50_pounds():
+     result = price([Line("TEE", Money(5000), 1)])
+     assert result.shipping == Money(0)
+     assert result.total == Money(5000)
++
++
++def test_a_discount_comes_off_the_items():
++    result = price([Line("TEE", Money(2000), 1)], percent_off=10)
++    assert result.subtotal == Money(2000)
++    assert result.discount == Money(200)
++    assert result.total == Money(1800 + 495)
++
++
++def test_a_discount_is_rounded_to_the_nearest_penny():
++    assert price([Line("TEE", Money(1033), 1)], percent_off=10).discount == Money(103)
++    assert price([Line("TEE", Money(1037), 1)], percent_off=10).discount == Money(104)
++
++
++def test_free_shipping_is_judged_after_the_discount():
++    result = price([Line("HOODIE", Money(5500), 1)], percent_off=10)
++    assert result.shipping == Money(495)
++    assert result.total == Money(4950 + 495)
++
++
++def test_a_100_percent_discount_makes_the_items_free():
++    result = price([Line("TEE", Money(2000), 1)], percent_off=100)
++    assert result.discount == Money(2000)
++    assert result.total == Money(495)
+-- 
+2.54.0 (Apple Git-157)
+

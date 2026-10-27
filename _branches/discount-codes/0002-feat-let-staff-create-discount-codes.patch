@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:05:47 +0000
+Subject: [PATCH 2/5] feat: let staff create discount codes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ migrations/003_discount_codes.sql |  4 ++++
+ shop/app.py                       | 19 +++++++++++++++-
+ shop/db.py                        | 21 ++++++++++++++++++
+ shop/schemas.py                   | 11 ++++++++-
+ tests/test_api.py                 | 37 +++++++++++++++++++++++++++++++
+ 5 files changed, 90 insertions(+), 2 deletions(-)
+ create mode 100644 migrations/003_discount_codes.sql
+
+diff --git a/migrations/003_discount_codes.sql b/migrations/003_discount_codes.sql
+new file mode 100644
+index 0000000..c3bb1b2
+--- /dev/null
++++ b/migrations/003_discount_codes.sql
+@@ -0,0 +1,4 @@
++CREATE TABLE discount_codes (
++    code TEXT PRIMARY KEY,
++    percent_off INTEGER NOT NULL
++);
+diff --git a/shop/app.py b/shop/app.py
+index 3b89063..b77b687 100644
+--- a/shop/app.py
++++ b/shop/app.py
+@@ -6,7 +6,15 @@ from shop import db
+ from shop.db import get_db
+ from shop.money import Money
+ from shop.pricing import Line, price
+-from shop.schemas import Checkout, NewProduct, order_json, price_json, product_json
++from shop.schemas import (
++    Checkout,
++    NewDiscountCode,
++    NewProduct,
++    discount_code_json,
++    order_json,
++    price_json,
++    product_json,
++)
+ 
+ STAFF_API_KEY = os.environ.get("SHOP_STAFF_API_KEY", "staff-secret")
+ 
+@@ -47,6 +55,15 @@ def add_product(body: NewProduct, conn=Depends(get_db)):
+     return product_json(product)
+ 
+ 
++@admin.post("/discount-codes", status_code=201)
++def add_discount_code(body: NewDiscountCode, conn=Depends(get_db)):
++    if db.get_discount_code(conn, body.code):
++        raise HTTPException(409, f"Discount code already exists: {body.code}")
++    discount_code = db.DiscountCode(body.code, body.percent_off)
++    db.add_discount_code(conn, discount_code)
++    return discount_code_json(discount_code)
++
++
+ @admin.get("/orders/{order_id}")
+ def get_order(order_id: int, conn=Depends(get_db)):
+     order = db.get_order(conn, order_id)
+diff --git a/shop/db.py b/shop/db.py
+index 99a815a..005aa4f 100644
+--- a/shop/db.py
++++ b/shop/db.py
+@@ -18,6 +18,12 @@ class Product:
+     price: Money
+ 
+ 
++@dataclass(frozen=True)
++class DiscountCode:
++    code: str
++    percent_off: int
++
++
+ @dataclass(frozen=True)
+ class Order:
+     id: int
+@@ -69,6 +75,21 @@ def add_product(conn: sqlite3.Connection, product: Product) -> None:
+         )
+ 
+ 
++def get_discount_code(conn: sqlite3.Connection, code: str) -> DiscountCode | None:
++    row = conn.execute("SELECT * FROM discount_codes WHERE code = ?", (code,)).fetchone()
++    if row is None:
++        return None
++    return DiscountCode(row["code"], row["percent_off"])
++
++
++def add_discount_code(conn: sqlite3.Connection, discount_code: DiscountCode) -> None:
++    with conn:
++        conn.execute(
++            "INSERT INTO discount_codes (code, percent_off) VALUES (?, ?)",
++            (discount_code.code, discount_code.percent_off),
++        )
++
++
+ def add_order(conn: sqlite3.Connection, lines: list[Line], price: Price) -> int:
+     with conn:
+         order_id = conn.execute(
+diff --git a/shop/schemas.py b/shop/schemas.py
+index f3e1e21..dfa72e6 100644
+--- a/shop/schemas.py
++++ b/shop/schemas.py
+@@ -1,6 +1,6 @@
+ from pydantic import BaseModel, Field
+ 
+-from shop.db import Order, Product
++from shop.db import DiscountCode, Order, Product
+ from shop.pricing import Price
+ 
+ 
+@@ -19,10 +19,19 @@ class NewProduct(BaseModel):
+     price: str = Field(pattern=r"^\d+\.\d\d$")
+ 
+ 
++class NewDiscountCode(BaseModel):
++    code: str = Field(min_length=1)
++    percent_off: int = Field(ge=1, le=100)
++
++
+ def product_json(product: Product) -> dict:
+     return {"sku": product.sku, "name": product.name, "price": str(product.price)}
+ 
+ 
++def discount_code_json(discount_code: DiscountCode) -> dict:
++    return {"code": discount_code.code, "percent_off": discount_code.percent_off}
++
++
+ def price_json(order_price: Price) -> dict:
+     return {
+         "subtotal": str(order_price.subtotal),
+diff --git a/tests/test_api.py b/tests/test_api.py
+index ac199de..df8f953 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -27,6 +27,43 @@ def test_add_product_with_an_existing_sku(client, staff_headers, add_product):
+     assert response.status_code == 409
+ 
+ 
++def test_add_discount_code(client, staff_headers):
++    response = client.post(
++        "/admin/discount-codes",
++        json={"code": "SAVE10", "percent_off": 10},
++        headers=staff_headers,
++    )
++
++    assert response.status_code == 201
++    assert response.json() == {"code": "SAVE10", "percent_off": 10}
++
++
++def test_add_discount_code_with_an_existing_code(client, staff_headers):
++    client.post(
++        "/admin/discount-codes",
++        json={"code": "SAVE10", "percent_off": 10},
++        headers=staff_headers,
++    )
++
++    response = client.post(
++        "/admin/discount-codes",
++        json={"code": "SAVE10", "percent_off": 20},
++        headers=staff_headers,
++    )
++
++    assert response.status_code == 409
++
++
++def test_discount_codes_can_take_up_to_100_percent_off(client, staff_headers):
++    for percent_off, status_code in [(0, 422), (1, 201), (100, 201), (101, 422)]:
++        response = client.post(
++            "/admin/discount-codes",
++            json={"code": f"CODE{percent_off}", "percent_off": percent_off},
++            headers=staff_headers,
++        )
++        assert response.status_code == status_code, percent_off
++
++
+ def test_checkout(client, add_product):
+     add_product("TEE", "15.00")
+     add_product("MUG", "8.00")
+-- 
+2.54.0 (Apple Git-157)
+

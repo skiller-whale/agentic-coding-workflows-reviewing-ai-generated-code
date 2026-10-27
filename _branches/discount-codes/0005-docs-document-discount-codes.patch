@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:16:39 +0000
+Subject: [PATCH 5/5] docs: document discount codes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .plans/discount-codes.md | 11 +++++++++++
+ docs/api.md              | 10 +++++++---
+ 2 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/.plans/discount-codes.md b/.plans/discount-codes.md
+index ffd00f2..42e5c15 100644
+--- a/.plans/discount-codes.md
++++ b/.plans/discount-codes.md
+@@ -9,3 +9,14 @@
+ 3. `feat: record the discount on orders` - orders store their discount and the code used, and `GET /admin/orders/{id}` shows them.
+ 4. `feat: apply a discount code at checkout` - `POST /checkout` takes an optional `discount_code`, and takes its percentage off the items.
+ 5. `docs: document discount codes` - update `docs/api.md`, and summarise the change in this plan.
++
++## Summary
++
++Staff can create a discount code with `POST /admin/discount-codes`, giving a whole-number percentage off from 1 to 100.
++Customers can pass an optional `discount_code` to `POST /checkout`, and that percentage comes off the items (not shipping).
++Each order stores its discount and the code used, and `GET /admin/orders/{id}` shows both.
++
++Decisions to flag in review:
++
++- **Free shipping is judged after the discount.** A £55 order with 10% off pays £49.50 for the items, so it no longer gets free shipping. Judging it on the subtotal before the discount instead would be a one-line change in `shop/pricing.py`.
++- **A code can take up to 100% off**, making the items free. The customer still pays shipping.
+diff --git a/docs/api.md b/docs/api.md
+index 023f880..80e784f 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -9,18 +9,22 @@ All amounts are in pounds, as strings with two decimal places (e.g. `"12.50"`).
+ | `GET /products`              | All   | List the products.                                                    |
+ | `POST /checkout`             | All   | Place an order: `{"items": [{"sku": "TEE", "quantity": 2}]}`.         |
+ | `POST /admin/products`       | Staff | Add a product: `{"sku": "TEE", "name": "T-shirt", "price": "15.00"}`. |
++| `POST /admin/discount-codes` | Staff | Add a discount code: `{"code": "SAVE10", "percent_off": 10}`.         |
+ | `GET /admin/orders/{id}`     | Staff | Get an order.                                                         |
+ 
+ Staff routes need the staff API key in an `X-API-Key` header.
+ 
++`POST /checkout` also takes an optional discount code: `{"items": [...], "discount_code": "SAVE10"}`.
++
+ ## Pricing
+ 
+ - The **subtotal** is the sum of each item's price times its quantity.
+-- **Shipping** is £4.95, and free when the subtotal is £50 or more.
+-- The **total** is the subtotal plus shipping.
++- The **discount** is the discount code's percentage of the subtotal, rounded to the nearest penny.
++- **Shipping** is £4.95, and free when the subtotal minus the discount is £50 or more.
++- The **total** is the subtotal minus the discount, plus shipping.
+ 
+ `POST /checkout` returns the order's ID and its price:
+ 
+ ```json
+-{"order_id": 1, "subtotal": "31.00", "shipping": "4.95", "total": "35.95"}
++{"order_id": 1, "subtotal": "30.00", "discount": "3.00", "shipping": "4.95", "total": "31.95"}
+ ```
+-- 
+2.54.0 (Apple Git-157)
+
